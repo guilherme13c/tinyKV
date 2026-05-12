@@ -152,7 +152,9 @@ All results: Intel Core i7-1165G7 @ 2.80GHz, linux/amd64, 8 logical cores, `-ben
 ### Three-way comparison: tinyKV vs LevelDB vs RocksDB
 
 > LevelDB and RocksDB figures use their CGO bindings at identical settings (sync=false).
-> Baseline key: 16 B, value: 64 B.
+> Baseline: key=16 B, value=64 B.
+
+#### Writes
 
 | Operation        | tinyKV          | LevelDB     | RocksDB     | vs LevelDB | vs RocksDB |
 | ---------------- | --------------- | ----------- | ----------- | ---------- | ---------- |
@@ -161,13 +163,33 @@ All results: Intel Core i7-1165G7 @ 2.80GHz, linux/amd64, 8 logical cores, `-ben
 | `delete`         | **2,377 ns/op** | 2,554 ns/op | 5,594 ns/op | **+7%**    | **+57%**   |
 | concurrent `put` | 4,494 ns/op     | 4,356 ns/op | 5,586 ns/op | −3%        | **+19%**   |
 
-tinyKV **beats LevelDB on deletes** and **beats RocksDB on every operation**, despite being a pure-Go, zero-dependency implementation. The write path bottleneck vs. LevelDB is key-comparison overhead in the SkipList (`bytes.Compare` vs. LevelDB's inlined comparator).
+tinyKV beats LevelDB on deletes and beats RocksDB on every write operation. The write path bottleneck vs. LevelDB is key-comparison overhead in the SkipList (`bytes.Compare` vs. LevelDB's inlined comparator).
+
+#### Reads
+
+| Operation           | tinyKV          | LevelDB     | RocksDB      | vs LevelDB  | vs RocksDB  |
+| ------------------- | --------------- | ----------- | ------------ | ----------- | ----------- |
+| `get` hot (memtable)| **189 ns/op**   | 546 ns/op   | 1,732 ns/op  | **+189%**   | **+817%**   |
+| `get` cold (SSTable)| **844 ns/op**   | 941 ns/op   | 5,010 ns/op  | **+11%**    | **+494%**   |
+| `get` miss (bloom)  | **122 ns/op**   | 233 ns/op   | 540 ns/op    | **+91%**    | **+343%**   |
+
+tinyKV dominates reads across all three scenarios. Hot reads are **2.9× faster than LevelDB** and **9.2× faster than RocksDB** — the CGO boundary adds hundreds of nanoseconds on every call; tinyKV is a direct Go function call. Cold reads are still 11% ahead of LevelDB.
+
+#### Scans
+
+| Range size  | tinyKV      | LevelDB       | RocksDB       | vs LevelDB  | vs RocksDB  |
+| ----------- | ----------- | ------------- | ------------- | ----------- | ----------- |
+| 100 keys    | **11,616 ns** | 44,543 ns   | 85,382 ns     | **+283%**   | **+635%**   |
+| 1,000 keys  | **92,828 ns** | 370,747 ns  | 799,150 ns    | **+299%**   | **+761%**   |
+| 10,000 keys | **811 µs**    | 3,304 µs    | 7,390 µs      | **+307%**   | **+811%**   |
+
+Scan allocs/op: tinyKV **13** (constant); LevelDB/RocksDB **202 / 201 per 100 keys** (one allocation per returned entry via CGO). tinyKV's merge iterator pre-allocates the heap once and reuses it for the entire range.
 
 ---
 
 ### Write throughput by payload size
 
-> `put` sequential, 8 goroutines, key fixed at 16 B.
+> `put` sequential, key fixed at 16 B.
 
 | Value size | ns/op   | Throughput  | Allocs/op |
 | ---------- | ------- | ----------- | --------- |
@@ -179,7 +201,7 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 ---
 
-### Read latency breakdown
+### Read latency breakdown (tinyKV, by key size)
 
 | Scenario              | key=16 B | key=64 B | key=256 B | Allocs/op |
 | --------------------- | -------- | -------- | --------- | --------- |
@@ -189,19 +211,19 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 **Hot reads** hit the SkipList under a shared read-lock — no allocation, no I/O.  
 **Cold reads** add one SSTable binary-search + bloom-filter probe (~700 ns extra).  
-**Misses** are nearly as fast as hot reads: the bloom filter rejects them before any disk access.
+**Misses** short-circuit at the bloom filter before any disk access.
 
 ---
 
-### Scan throughput
+### Scan throughput (tinyKV, by range size)
 
-| Range size | ns/op     | Throughput  |
-| ---------- | --------- | ----------- |
-| 100 keys   | 9,447     | 847 MB/s    |
-| 1,000 keys | 80,693    | 991 MB/s    |
-| 10,000 keys| 728,717   | 1,098 MB/s  |
+| Range size  | ns/op     | Throughput  | Allocs/op |
+| ----------- | --------- | ----------- | --------- |
+| 100 keys    | 11,616    | 689 MB/s    | 13        |
+| 1,000 keys  | 92,828    | 862 MB/s    | 13        |
+| 10,000 keys | 811,114   | 986 MB/s    | 13        |
 
-Scan throughput scales well because the iterator merges a sorted SkipList with sorted SSTable blocks — nearly sequential memory access once the SSTable index is warm.
+Alloc count stays constant regardless of range size — the merge iterator heap is allocated once per `Scan` call.
 
 ---
 
