@@ -18,7 +18,7 @@ type sstEntry struct {
 func buildSST(t *testing.T, dir string, entries []sstEntry) *sstable.Reader {
 	t.Helper()
 	path := filepath.Join(dir, "test.sst")
-	w, err := sstable.NewWriter(path)
+	w, err := sstable.NewWriter(path, 0)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestSSTMultipleBlocks(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "multiblock.sst")
 
-	w, err := sstable.NewWriter(path)
+	w, err := sstable.NewWriter(path, 0)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestSSTPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "path-check.sst")
 
-	w, err := sstable.NewWriter(path)
+	w, err := sstable.NewWriter(path, 0)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestSSTEmptySSTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty.sst")
 
-	w, err := sstable.NewWriter(path)
+	w, err := sstable.NewWriter(path, 0)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}

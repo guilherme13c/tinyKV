@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"container/heap"
 
 	mt "github.com/guilherme13c/tinyKV/src/memtable"
 )
@@ -17,28 +16,71 @@ type mergeEntry struct {
 
 type entryHeap []mergeEntry
 
-func (h entryHeap) Len() int { return len(h) }
-func (h entryHeap) Less(i, j int) bool {
+func (h entryHeap) less(i, j int) bool {
 	cmp := bytes.Compare(h[i].key, h[j].key)
 	if cmp != 0 {
 		return cmp < 0
 	}
 	return h[i].sourceIdx < h[j].sourceIdx // newer source wins on tie
 }
-func (h entryHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *entryHeap) Push(x any)         { *h = append(*h, x.(mergeEntry)) }
-func (h *entryHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+
+func (h *entryHeap) push(e mergeEntry) {
+	*h = append(*h, e)
+	h.siftUp(len(*h) - 1)
+}
+
+func (h *entryHeap) pop() mergeEntry {
+	root := (*h)[0]
+	n := len(*h) - 1
+	(*h)[0] = (*h)[n]
+	*h = (*h)[:n]
+	if n > 0 {
+		h.siftDown(0)
+	}
+	return root
+}
+
+func (h *entryHeap) siftUp(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if h.less(i, parent) {
+			(*h)[i], (*h)[parent] = (*h)[parent], (*h)[i]
+			i = parent
+		} else {
+			break
+		}
+	}
+}
+
+func (h *entryHeap) siftDown(i int) {
+	n := len(*h)
+	for {
+		smallest := i
+		if left := 2*i + 1; left < n && h.less(left, smallest) {
+			smallest = left
+		}
+		if right := 2*i + 2; right < n && h.less(right, smallest) {
+			smallest = right
+		}
+		if smallest == i {
+			break
+		}
+		(*h)[i], (*h)[smallest] = (*h)[smallest], (*h)[i]
+		i = smallest
+	}
+}
+
+func (h *entryHeap) heapify() {
+	for i := len(*h)/2 - 1; i >= 0; i-- {
+		h.siftDown(i)
+	}
 }
 
 type mergeIterator struct {
-	h                entryHeap
-	endKey           []byte
-	curr             *mergeEntry
+	h                 entryHeap
+	endKey            []byte
+	curr              mergeEntry
+	currValid         bool
 	includeTombstones bool
 }
 
@@ -62,7 +104,7 @@ func newMergeIteratorOpts(iters []mt.MemTableIteratorI, startKey, endKey []byte,
 			})
 		}
 	}
-	heap.Init(&h)
+	h.heapify()
 	mi := &mergeIterator{h: h, endKey: endKey, includeTombstones: includeTombstones}
 	mi.advance()
 	return mi
@@ -71,23 +113,23 @@ func newMergeIteratorOpts(iters []mt.MemTableIteratorI, startKey, endKey []byte,
 func (mi *mergeIterator) advance() {
 	for {
 		if len(mi.h) == 0 {
-			mi.curr = nil
+			mi.currValid = false
 			return
 		}
 
-		top := heap.Pop(&mi.h).(mergeEntry)
+		top := mi.h.pop()
 
 		if mi.endKey != nil && bytes.Compare(top.key, mi.endKey) >= 0 {
-			mi.curr = nil
+			mi.currValid = false
 			return
 		}
 
 		// Drain stale entries with the same key from older sources.
 		for len(mi.h) > 0 && bytes.Equal(mi.h[0].key, top.key) {
-			stale := heap.Pop(&mi.h).(mergeEntry)
+			stale := mi.h.pop()
 			stale.iter.Next()
 			if stale.iter.Valid() {
-				heap.Push(&mi.h, mergeEntry{
+				mi.h.push(mergeEntry{
 					key:       stale.iter.Key(),
 					value:     stale.iter.Value(),
 					tombstone: stale.iter.IsTombstone(),
@@ -100,7 +142,7 @@ func (mi *mergeIterator) advance() {
 		// Advance the winning iterator and push its next entry back.
 		top.iter.Next()
 		if top.iter.Valid() {
-			heap.Push(&mi.h, mergeEntry{
+			mi.h.push(mergeEntry{
 				key:       top.iter.Key(),
 				value:     top.iter.Value(),
 				tombstone: top.iter.IsTombstone(),
@@ -113,13 +155,13 @@ func (mi *mergeIterator) advance() {
 			continue
 		}
 
-		entry := top
-		mi.curr = &entry
+		mi.curr = top
+		mi.currValid = true
 		return
 	}
 }
 
-func (mi *mergeIterator) Valid() bool       { return mi.curr != nil }
+func (mi *mergeIterator) Valid() bool       { return mi.currValid }
 func (mi *mergeIterator) Key() []byte       { return mi.curr.key }
 func (mi *mergeIterator) Value() []byte     { return mi.curr.value }
 func (mi *mergeIterator) IsTombstone() bool { return mi.curr.tombstone }

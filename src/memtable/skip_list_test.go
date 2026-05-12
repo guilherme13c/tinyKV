@@ -300,3 +300,41 @@ func TestSkipListLarge(t *testing.T) {
 		}
 	}
 }
+
+func TestSkipListRelease(t *testing.T) {
+	// Release must not panic and must allow the arena slab to be reused.
+	sl := NewSkipList()
+	for i := range 100 {
+		key := fmt.Sprintf("key-%03d", i)
+		if err := sl.Put([]byte(key), []byte("val"), false); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	sl.Release()
+
+	// A new SkipList created after Release should get a fresh slab from the pool
+	// and work correctly — confirming the slab was returned and zeroed properly.
+	sl2 := NewSkipList()
+	defer sl2.Release()
+
+	if err := sl2.Put([]byte("after-release"), []byte("ok"), false); err != nil {
+		t.Fatalf("Put after pool reuse: %v", err)
+	}
+	val, err := sl2.Get([]byte("after-release"))
+	if err != nil {
+		t.Fatalf("Get after pool reuse: %v", err)
+	}
+	if string(val) != "ok" {
+		t.Fatalf("Get: got %q, want %q", val, "ok")
+	}
+
+	// Verify that keys from the released list are not visible (arena was zeroed).
+	if _, err := sl2.Get([]byte("key-000")); err == nil {
+		t.Fatal("expected key-000 to be absent in new SkipList, but Get succeeded")
+	}
+
+	// Double-Release must not panic.
+	sl2.Release()
+	sl2.Release()
+}

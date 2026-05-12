@@ -430,3 +430,72 @@ func TestStoreCloseWaitsFlush(t *testing.T) {
 		}
 	}
 }
+
+// TestStoreConcurrentWrites exercises the dual-lock write path (mu.RLock +
+// memMu.Lock) with many goroutines writing simultaneously. The race detector
+// will catch any data race introduced by incorrect lock usage.
+func TestStoreConcurrentWrites(t *testing.T) {
+	s := newTestStore(t)
+
+	const goroutines = 20
+	const writesPerGoroutine = 50
+
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for g := range goroutines {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range writesPerGoroutine {
+				key := fmt.Sprintf("cw-g%02d-k%03d", id, i)
+				val := fmt.Sprintf("val-%02d-%03d", id, i)
+				if err := s.Put([]byte(key), []byte(val)); err != nil {
+					errs[id] = fmt.Errorf("Put(%q): %w", key, err)
+					return
+				}
+			}
+			// Interleave deletes to exercise the Delete dual-lock path too.
+			for i := range writesPerGoroutine / 2 {
+				key := fmt.Sprintf("cw-g%02d-k%03d", id, i)
+				if err := s.Delete([]byte(key)); err != nil {
+					errs[id] = fmt.Errorf("Delete(%q): %w", key, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	for g, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: %v", g, err)
+		}
+	}
+
+	// Verify the second half of each goroutine's keys are still readable.
+	for g := range goroutines {
+		for i := writesPerGoroutine / 2; i < writesPerGoroutine; i++ {
+			key := fmt.Sprintf("cw-g%02d-k%03d", g, i)
+			want := fmt.Sprintf("val-%02d-%03d", g, i)
+			got, err := s.Get([]byte(key))
+			if err != nil {
+				t.Errorf("Get(%q): %v", key, err)
+				continue
+			}
+			if string(got) != want {
+				t.Errorf("Get(%q): got %q, want %q", key, got, want)
+			}
+		}
+		// The first half were deleted — they must be absent.
+		for i := range writesPerGoroutine / 2 {
+			key := fmt.Sprintf("cw-g%02d-k%03d", g, i)
+			_, err := s.Get([]byte(key))
+			if err == nil {
+				t.Errorf("Get(%q): expected key-not-found after Delete, got nil error", key)
+			} else if !errors.Is(err, src.ErrKeyNotFound) {
+				t.Errorf("Get(%q): unexpected error %v", key, err)
+			}
+		}
+	}
+}

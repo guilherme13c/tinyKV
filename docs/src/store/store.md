@@ -22,15 +22,15 @@ Upsert. Writes `value` for `key`. If `key` already exists its value is replaced.
 There is no uniqueness constraint — duplicate puts are silently accepted, and the
 most recent put wins on a subsequent `Get`.
 
-Steps (under write lock):
-1. Check `bgErr`; surface any previous background-flush error immediately.
-2. Append a non-tombstone record to the WAL.
-3. Insert into the active memtable.
-4. If `memtable.SizeInBytes() > sizeThreshold` and no flush is already in
-   progress, call `freeze()`.
+Steps (under the dual-lock protocol):
+1. Check `bgErr` under `mu.RLock()`; surface any previous background-flush error immediately.
+2. Append a non-tombstone record to the WAL (while holding `mu.RLock()`; WAL batches concurrent writers).
+3. Insert into the active memtable under `memMu.Lock()`.
+4. After releasing both locks, if `memtable.SizeInBytes() > sizeThreshold` and no flush is already
+   in progress, re-acquire `mu.Lock()` and call `freeze()` (with a double-check inside).
 
-Returns the first error encountered; partial writes are **not** possible because
-WAL and memtable are updated atomically under the write lock.
+Returns the first error encountered; a WAL error prevents the SkipList insert, so
+partial writes are **not** possible.
 
 ---
 
@@ -75,8 +75,9 @@ Tombstoned keys are silently skipped (the iterator is created with
 
 The caller **must** call `Close()` on the returned iterator when done.
 
-**Concurrency note.** The read lock is held only for the duration of `Scan` itself
-(while the iterator is constructed). Once the iterator is returned, the caller
+**Concurrency note.** The read lock (`mu.RLock`) is held only for the duration of `Scan` itself
+(while the iterator is constructed); `memMu.RLock` is held for the shorter inner
+window of `memtable.Iterator()`. Once the iterator is returned, the caller
 operates on it without holding any lock. This is safe because:
 - The memtable is append-only — entries already present when the iterator was
   created are stable.
@@ -115,6 +116,7 @@ type Store struct {
     walPath   string
     dir       string
     mu        sync.RWMutex
+    memMu     sync.RWMutex
     bgErr     error
     flushWg   sync.WaitGroup
 }
@@ -131,7 +133,8 @@ type Store struct {
 | `manifest` | `*manifest` | Tracks which SSTable files are live on disk. |
 | `walPath` | `string` | Absolute path of the active WAL file. The immutable WAL lives at `walPath + ".immutable"`. |
 | `dir` | `string` | Directory that holds SSTable files and the MANIFEST. |
-| `mu` | `sync.RWMutex` | Guards all mutable fields. Read operations use `RLock`; write operations and state mutations use `Lock`. |
+| `mu` | `sync.RWMutex` | Guards the SSTable list, the `immutable` pointer, `bgErr`, and `flushWg`. Held shared (`RLock`) during normal reads and writes; held exclusively (`Lock`) only for freeze and compaction. Always acquired before `memMu`. |
+| `memMu` | `sync.RWMutex` | Guards the active memtable (SkipList). Held exclusively for SkipList inserts; held shared for SkipList reads. Always acquired inside `mu`. |
 | `bgErr` | `error` | Last error from a background flush goroutine. Checked at the start of every write; surfaces the error to the caller. |
 | `flushWg` | `sync.WaitGroup` | Tracks the single in-flight background flush goroutine. `flushWg.Wait()` in `Close` ensures all data is durable before shutdown. |
 
@@ -182,15 +185,37 @@ manifest, so not loaded).
 func (s *Store) Put(key []byte, value []byte) error
 ```
 
+`Put` uses a **two-lock protocol** that allows concurrent WAL writes while still
+serialising SkipList inserts:
+
 ```
-Lock()
+mu.RLock()                          // shared: allows concurrent Put/Delete/Get
   check bgErr
-  wal.Append(key, value, tombstone=false)
-  memtable.Put(key, value, tombstone=false)
-  if memtable.SizeInBytes() > sizeThreshold && immutable == nil:
-      freeze()
-Unlock()
+  wal.Append(key, value, tombstone=false)   // WAL batches concurrent appends
+  memMu.Lock()                      // exclusive: SkipList is not thread-safe
+    memtable.Put(key, value, tombstone=false)
+    size = memtable.SizeInBytes()
+  memMu.Unlock()
+mu.RUnlock()
+
+if size > sizeThreshold && immutable == nil:
+    mu.Lock()                       // re-acquire exclusive for freeze
+      if memtable.SizeInBytes() > sizeThreshold && immutable == nil:
+          freeze()                  // double-check: another goroutine may have frozen
+    mu.Unlock()
 ```
+
+**Lock ordering:** `mu` is always acquired before `memMu`. `memMu` is never held
+when acquiring `mu`.
+
+The `mu.RLock()` during the write phase prevents the flush goroutine from
+swapping the memtable epoch mid-write (freeze requires `mu.Lock()`). This means
+multiple goroutines can append to the WAL concurrently — the WAL writer uses
+write-stealing to batch them — while `memMu.Lock()` serialises the subsequent
+SkipList insertions.
+
+Returns the first error encountered. A WAL error prevents the SkipList insert, so
+partial writes are not possible.
 
 ---
 
@@ -201,11 +226,13 @@ func (s *Store) Get(key []byte) ([]byte, error)
 ```
 
 ```
-RLock()
-  memtable.Lookup(key)
-      found + tombstone  → return KeyNotFoundError
-      found + live       → return value
-  immutable.Lookup(key)   (if immutable != nil)
+mu.RLock()
+  memMu.RLock()
+    memtable.Lookup(key)            // active SkipList needs memMu
+        found + tombstone  → return KeyNotFoundError
+        found + live       → return value
+  memMu.RUnlock()
+  immutable.Lookup(key)             // frozen; only mu.RLock needed
       found + tombstone  → return KeyNotFoundError
       found + live       → return value
   for each reader in sstables (newest first):
@@ -213,16 +240,19 @@ RLock()
           ok             → return value
           ErrTombstone   → return KeyNotFoundError
   return KeyNotFoundError
-RUnlock()
+mu.RUnlock()
 ```
 
 ---
 
 ## `Delete`
 
-Identical to `Put` with `isTombstone=true`. The WAL record and memtable entry
-both carry the tombstone flag. Subsequent `Get` calls will find the tombstone
-before any older value and return `KeyNotFoundError`.
+Identical to `Put` with `isTombstone=true`. The same two-lock protocol applies:
+`mu.RLock()` is held while the WAL record is written; `memMu.Lock()` is then
+taken exclusively for the SkipList insert; a conditional `mu.Lock()` follows if
+a freeze is needed. The WAL record and memtable entry both carry the tombstone
+flag. Subsequent `Get` calls will find the tombstone before any older value and
+return `KeyNotFoundError`.
 
 ---
 
@@ -233,14 +263,16 @@ func (s *Store) Scan(startKey []byte, endKey []byte) (mt.MemTableIteratorI, erro
 ```
 
 ```
-RLock()
-  iters = [memtable.Iterator()]
+mu.RLock()
+  memMu.RLock()
+    iter = memtable.Iterator()      // active SkipList needs memMu
+  memMu.RUnlock()
   if immutable != nil:
-      iters = append(iters, immutable.Iterator())
+      iters = append(iters, immutable.Iterator())   // frozen; only mu.RLock needed
   for each r in sstables:
       iters = append(iters, r.Iterator())
   return newMergeIterator(iters, startKey, endKey)
-RUnlock()
+mu.RUnlock()
 ```
 
 Source ordering (`iters[0]` = newest) mirrors `Get`'s lookup order, so the merge
@@ -309,6 +341,7 @@ Runs in a dedicated goroutine. All heavy I/O occurs **outside** the lock.
 
 ```
 defer flushWg.Done()
+defer imm.Release()                // return arena slab to pool after flush
 
 path = dir + "/" + time.Now().UnixNano() + ".sst"
 sstWriter = sst.NewWriter(path)
@@ -406,8 +439,10 @@ for entry in memtable.Iterator():
 
 sstWriter.Close()
 r = sst.NewReader(path)
+old = memtable
 sstables = [r] + sstables
 memtable = mt.NewSkipList()
+old.Release()                      // return arena slab to pool
 manifest.recordAdd(path)
 
 wal.Close()
@@ -444,3 +479,5 @@ Files are named `{time.Now().UnixNano()}.sst`.
 | Filename uniqueness | Nanosecond timestamp | UUID or monotonic sequence number |
 | Compaction scheduling | Triggered synchronously at end of flush goroutine | Background compaction thread |
 | bgErr recovery | Permanent; store is dead after a background error | Could retry or fall back to sync flush |
+| Concurrent safety | Dual-lock: `mu.RLock` for WAL + epoch protection; `memMu.Lock` for SkipList insert. Concurrent `Put`/`Delete` calls share WAL writes and only serialise at the SkipList. `mu.Lock` is taken exclusively only for freeze/compaction. Lock ordering: always `mu` before `memMu`. | Single global lock (simpler, less throughput under concurrent writers) |
+| Arena allocation | `NewSkipList()` draws a 65 536-node slab from `arenaPool` (cap 4); `Release()` zeroes and returns it. `flushBackground` calls `defer imm.Release()`; `flushSync` calls `old.Release()` before replacement. | Per-node heap allocation (simpler, higher GC pressure) |

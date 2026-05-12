@@ -32,7 +32,7 @@ The package exposes two interfaces:
 
 | Interface | Purpose |
 |---|---|
-| `MemTableI` | Read/write access — Put, Get, Lookup, SizeInBytes, Iterator |
+| `MemTableI` | Read/write access — Put, Get, Lookup, SizeInBytes, Iterator, Release |
 | `MemTableIteratorI` | Forward sorted scan over all entries, including tombstones |
 
 Separating the iterator from the table provides two concrete benefits:
@@ -65,6 +65,41 @@ Skip lists are a pragmatic fit for memtables:
 | **Hash Map** | O(1) avg | O(n log n) † | Fastest point lookups; †sorted scan requires a full sort at flush time; no ordering during the scan itself |
 
 A hash map is the only poor fit for this role: the flush path needs to write keys to an SSTable in sorted order. An ordered structure (skip list, tree) provides that for free; a hash map requires a separate O(n log n) sort step at flush time.
+
+### Memory Management: Arena Pool
+
+To eliminate per-node heap pressure on the garbage collector, `SkipList` allocates nodes from a **channel-based arena pool** rather than calling `new(skipListNode)` for each insertion.
+
+#### Slab layout
+
+```
+arenaPool = make(chan []skipListNode, 4)   // pool of 4 pre-allocated slabs
+```
+
+Each slab is a `[]skipListNode` of length 65536 (≈ 7.3 MB). On creation, two slots are reserved:
+
+| Index | Purpose |
+|---|---|
+| 0 | Tail sentinel node |
+| 1 | Head sentinel node |
+| 2+ | Bump-allocated node storage (`arenaTop` starts at 2) |
+
+`newNode()` advances `arenaTop` to hand out the next slot. If the arena is exhausted (rare, large memtable), it falls back to a plain heap allocation so correctness is never compromised.
+
+#### Lifetime
+
+- **Acquired** in `NewSkipList()`: a slab is pulled from `arenaPool` (or freshly allocated if the pool is empty).
+- **Released** in `Release()`: all used slots are zeroed and the slab is returned to the pool via a non-blocking send.
+
+`Release()` is part of the `MemTableI` interface so the store can reclaim the arena immediately after a flush, before starting the next memtable.
+
+#### Why a channel pool instead of `sync.Pool`?
+
+`sync.Pool` is cleared at every GC cycle. Because the store triggers a flush (and therefore arena reclamation) on a timer whose period aligns with GC pressure, using `sync.Pool` would cause slabs to be discarded precisely when they are most needed. A channel pool retains slabs **across GC pauses**, guaranteeing reuse regardless of collection timing.
+
+#### Performance impact
+
+The arena reduces allocation pressure to **1 alloc/op** for `PutSeq`, `PutRandom`, and `Delete` benchmarks. Without it, each node insertion incurred a separate heap allocation visible to the GC.
 
 ---
 

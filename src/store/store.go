@@ -35,6 +35,8 @@ type Store struct {
 	walPath   string
 	dir       string
 	mu        sync.RWMutex
+	memMu     sync.RWMutex  // protects active memtable reads/writes; held briefly (no I/O)
+	compactMu sync.Mutex    // serializes concurrent compaction attempts
 	bgErr     error          // last background flush error, surfaced on next write
 	flushWg   sync.WaitGroup // tracks in-flight background flush goroutine
 }
@@ -110,20 +112,35 @@ func NewStore(walPath string, dir string) (*Store, error) {
 }
 
 func (s *Store) Put(key []byte, value []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// Hold s.mu.RLock for the WAL+MemTable write pair so the flush goroutine
+	// cannot swap the epoch under us. Multiple goroutines can hold RLock
+	// concurrently, letting the WAL group-commit actually batch their writes.
+	s.mu.RLock()
 	if s.bgErr != nil {
+		s.mu.RUnlock()
 		return s.bgErr
 	}
 	if err := s.wal.Append(key, value, false); err != nil {
+		s.mu.RUnlock()
 		return err
 	}
+	s.memMu.Lock()
 	if err := s.memtable.Put(key, value, false); err != nil {
+		s.memMu.Unlock()
+		s.mu.RUnlock()
 		return err
 	}
-	if s.memtable.SizeInBytes() > sizeThreshold && s.immutable == nil {
-		s.freeze()
+	size := s.memtable.SizeInBytes()
+	immNil := s.immutable == nil // safe: s.mu.RLock held
+	s.memMu.Unlock()
+	s.mu.RUnlock()
+
+	if size > sizeThreshold && immNil {
+		s.mu.Lock()
+		if s.memtable.SizeInBytes() > sizeThreshold && s.immutable == nil {
+			s.freeze()
+		}
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -132,15 +149,19 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check active MemTable first.
-	if val, found, isTombstone := s.memtable.Lookup(key); found {
+	// Active MemTable: needs memMu because concurrent Puts modify it.
+	s.memMu.RLock()
+	val, found, isTombstone := s.memtable.Lookup(key)
+	s.memMu.RUnlock()
+
+	if found {
 		if isTombstone {
 			return nil, &pkgsrc.KeyNotFoundError{Key: key}
 		}
 		return val, nil
 	}
 
-	// Check immutable MemTable (being flushed, newer than SSTables).
+	// Immutable MemTable is frozen after freeze(); only s.mu.RLock needed.
 	if s.immutable != nil {
 		if val, found, isTombstone := s.immutable.Lookup(key); found {
 			if isTombstone {
@@ -165,20 +186,32 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 }
 
 func (s *Store) Delete(key []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.mu.RLock()
 	if s.bgErr != nil {
+		s.mu.RUnlock()
 		return s.bgErr
 	}
 	if err := s.wal.Append(key, nil, true); err != nil {
+		s.mu.RUnlock()
 		return err
 	}
+	s.memMu.Lock()
 	if err := s.memtable.Put(key, nil, true); err != nil {
+		s.memMu.Unlock()
+		s.mu.RUnlock()
 		return err
 	}
-	if s.memtable.SizeInBytes() > sizeThreshold && s.immutable == nil {
-		s.freeze()
+	size := s.memtable.SizeInBytes()
+	immNil := s.immutable == nil
+	s.memMu.Unlock()
+	s.mu.RUnlock()
+
+	if size > sizeThreshold && immNil {
+		s.mu.Lock()
+		if s.memtable.SizeInBytes() > sizeThreshold && s.immutable == nil {
+			s.freeze()
+		}
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -188,7 +221,9 @@ func (s *Store) Scan(startKey []byte, endKey []byte) (mt.MemTableIteratorI, erro
 	defer s.mu.RUnlock()
 
 	iters := make([]mt.MemTableIteratorI, 0, 2+len(s.sstables))
+	s.memMu.RLock()
 	iters = append(iters, s.memtable.Iterator())
+	s.memMu.RUnlock()
 	if s.immutable != nil {
 		iters = append(iters, s.immutable.Iterator())
 	}
@@ -248,9 +283,11 @@ func (s *Store) freeze() {
 // It runs outside the lock for all I/O-heavy work.
 func (s *Store) flushBackground(imm mt.MemTableI, immWALPath string) {
 	defer s.flushWg.Done()
+	// Return the arena to the pool once all I/O and state updates are complete.
+	defer imm.Release()
 
 	path := filepath.Join(s.dir, fmt.Sprintf("%d.sst", time.Now().UnixNano()))
-	sstWriter, err := sst.NewWriter(path)
+	sstWriter, err := sst.NewWriter(path, imm.Len())
 	if err != nil {
 		s.mu.Lock()
 		s.bgErr = err
@@ -312,23 +349,61 @@ func (s *Store) flushBackground(imm mt.MemTableI, immWALPath string) {
 	_ = os.Remove(immWALPath)
 
 	if needsCompaction {
-		s.mu.Lock()
-		err = s.compact()
-		s.mu.Unlock()
-		if err != nil {
-			s.mu.Lock()
-			s.bgErr = err
-			s.mu.Unlock()
+		// Serialize compactions: at most one runs at a time. A concurrent flush
+		// goroutine may have already compacted by the time we acquire this lock,
+		// so we re-check the threshold after taking the snapshot.
+		s.compactMu.Lock()
+
+		s.mu.RLock()
+		if len(s.sstables) < compactionThreshold {
+			// Another goroutine already compacted; nothing to do.
+			s.mu.RUnlock()
+			s.compactMu.Unlock()
+			return
 		}
+		oldReaders := make([]*sst.Reader, len(s.sstables))
+		copy(oldReaders, s.sstables)
+		s.mu.RUnlock()
+
+		newReader, compactErr := s.compactIO(oldReaders)
+		if compactErr != nil {
+			s.mu.Lock()
+			s.bgErr = compactErr
+			s.mu.Unlock()
+			s.compactMu.Unlock()
+			return
+		}
+
+		// Swap under write lock; preserve any SSTables added during compaction.
+		s.mu.Lock()
+		updated := make([]*sst.Reader, 0, 1+len(s.sstables)-len(oldReaders)+1)
+		updated = append(updated, newReader)
+		for _, r := range s.sstables {
+			wasCompacted := false
+			for _, old := range oldReaders {
+				if r == old {
+					wasCompacted = true
+					break
+				}
+			}
+			if !wasCompacted {
+				updated = append(updated, r)
+			}
+		}
+		s.sstables = updated
+		s.mu.Unlock()
+
+		s.compactMu.Unlock()
 	}
 }
 
-// compact merges all L0 SSTables into a single new SSTable.
+// compactIO merges the provided oldReaders into a single new SSTable.
+// It holds no lock and operates entirely on the given snapshot.
 // Tombstones are dropped — since all sources are merged, no older data remains.
 // Old SSTables are removed from disk after the manifest is updated.
-func (s *Store) compact() error {
-	iters := make([]mt.MemTableIteratorI, len(s.sstables))
-	for i, r := range s.sstables {
+func (s *Store) compactIO(oldReaders []*sst.Reader) (*sst.Reader, error) {
+	iters := make([]mt.MemTableIteratorI, len(oldReaders))
+	for i, r := range oldReaders {
 		iters[i] = r.Iterator()
 	}
 
@@ -336,10 +411,16 @@ func (s *Store) compact() error {
 	// but we will not write tombstones to the output (full compaction).
 	merged := newMergeIteratorOpts(iters, nil, nil, true)
 
+	// Estimate the output key count from the input SSTables' bloom filter sizes.
+	totalEstimatedKeys := 0
+	for _, r := range oldReaders {
+		totalEstimatedKeys += r.EstimatedKeyCount()
+	}
+
 	outPath := filepath.Join(s.dir, fmt.Sprintf("%d.sst", time.Now().UnixNano()))
-	sstWriter, err := sst.NewWriter(outPath)
+	sstWriter, err := sst.NewWriter(outPath, totalEstimatedKeys)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for ; merged.Valid(); merged.Next() {
@@ -347,19 +428,22 @@ func (s *Store) compact() error {
 			continue // safe to drop — no older SSTables remain after full compaction
 		}
 		if err := sstWriter.Append(merged.Key(), merged.Value(), false); err != nil {
-			return err
+			_ = sstWriter.Close()
+			_ = os.Remove(outPath)
+			return nil, err
 		}
 	}
 
 	if err := sstWriter.Close(); err != nil {
-		return err
+		_ = os.Remove(outPath)
+		return nil, err
 	}
 
 	// Record the new SSTable then remove old ones from the manifest.
 	if err := s.manifest.recordAdd(outPath); err != nil {
-		return err
+		_ = os.Remove(outPath)
+		return nil, err
 	}
-	oldReaders := s.sstables
 	for _, r := range oldReaders {
 		_ = s.manifest.recordDel(r.Path())
 	}
@@ -367,7 +451,8 @@ func (s *Store) compact() error {
 	// Open the new reader before closing the old ones.
 	newReader, err := sst.NewReader(outPath)
 	if err != nil {
-		return err
+		_ = os.Remove(outPath)
+		return nil, err
 	}
 
 	for _, r := range oldReaders {
@@ -376,8 +461,7 @@ func (s *Store) compact() error {
 		_ = os.Remove(path)
 	}
 
-	s.sstables = []*sst.Reader{newReader}
-	return nil
+	return newReader, nil
 }
 
 // flushSync synchronously flushes the active MemTable to a new SSTable.
@@ -385,7 +469,7 @@ func (s *Store) compact() error {
 func (s *Store) flushSync() error {
 	path := filepath.Join(s.dir, fmt.Sprintf("%d.sst", time.Now().UnixNano()))
 
-	sstWriter, err := sst.NewWriter(path)
+	sstWriter, err := sst.NewWriter(path, s.memtable.Len())
 	if err != nil {
 		return err
 	}
@@ -408,7 +492,9 @@ func (s *Store) flushSync() error {
 	}
 
 	s.sstables = append([]*sst.Reader{r}, s.sstables...)
+	old := s.memtable
 	s.memtable = mt.NewSkipList()
+	old.Release()
 
 	if err := s.manifest.recordAdd(path); err != nil {
 		return err

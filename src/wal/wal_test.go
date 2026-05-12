@@ -409,8 +409,7 @@ func TestWALWriterClosed(t *testing.T) {
 	}
 
 	// Append after Close should return an error.
-	// Use a goroutine with timeout to guard against potential deadlock
-	// from the select race between reqChan and doneChan.
+	// Use a goroutine with a timeout to guard against potential deadlock.
 	done := make(chan error, 1)
 	go func() {
 		done <- w.Append([]byte("k"), []byte("v"), false)

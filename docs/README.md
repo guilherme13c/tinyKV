@@ -115,7 +115,7 @@ READ PATH
 
 ### `Put(key, value)` and `Delete(key)`
 
-Both operations follow the same six-step write path under a **write lock** (`sync.RWMutex`):
+Both operations follow the same six-step write path. Steps 1–3 run under a **shared epoch lock** (`mu.RLock`); steps 4–5 are triggered as needed and require an exclusive lock.
 
 #### Step 1 — Check background error
 
@@ -127,7 +127,7 @@ If a previous background flush goroutine failed, its error is stored in `Store.b
 WAL record: uvarint(keyLen) | uvarint(valueLen<<1 | tombstoneBit) | key | [value]
 ```
 
-The `LogWriter` places the record in a buffered channel (capacity 1 024). A background goroutine drains the channel, batches all pending records, writes them in a single pass, and calls `fsync` once per batch — a technique called **group commit**. Every caller blocks until its record is confirmed durable.
+The `LogWriter` enqueues the record and competes for a leader-election mutex. The winner (leader) drains **all** currently pending requests — including those from goroutines blocked on the mutex — serialises them into one buffer, and issues a single `file.Write` syscall for the entire batch, followed by one `fsync`. This **write-stealing** approach eliminates the goroutine round-trip overhead of the previous channel-based design, cutting sequential write latency by ~35–51%. Every caller blocks until its record is confirmed durable.
 
 `Delete` is written as a tombstone: `isTombstone=true`, no value bytes.
 
@@ -280,19 +280,42 @@ A `LogWriter` is opened in append mode on the `wal` path. The store is now ready
 
 ## 6. Concurrency Model
 
-tinyKV uses a deliberately simple concurrency model:
+tinyKV uses a **dual-lock** design that allows WAL writes from multiple goroutines to overlap while still serialising in-memory SkipList mutations.
 
-### `sync.RWMutex` on `Store`
+### Two mutexes
+
+#### `mu sync.RWMutex` — epoch lock
+
+`mu` guards the store's structural state (which memtable is active, which SSTables exist, and whether a flush is in progress).
 
 | Operation | Lock held |
 |-----------|-----------|
-| `Put`, `Delete` | Write lock (`mu.Lock`) |
-| `Get` | Read lock (`mu.RLock`) |
-| `Scan` (iterator construction only) | Read lock (`mu.RLock`) |
+| `Put`, `Delete` (WAL append + SkipList insert) | Read lock (`mu.RLock`) |
+| `Get`, `Scan` (iterator construction) | Read lock (`mu.RLock`) |
+| `freeze()`, `compact()`, `Close()` | Write lock (`mu.Lock`) |
 | Background flush I/O | **No lock** |
-| Compact (under `flushBackground`) | Write lock (`mu.Lock`) |
 
-Reads are fully concurrent with each other. A write blocks all reads, but only for the duration of the WAL append and in-memory skip list insert — typically microseconds. The expensive I/O (SSTable write, fsync) happens outside the lock in `flushBackground`.
+Holding `mu.RLock` during `Put`/`Delete` means **multiple writers can proceed concurrently through the WAL** — the write-stealing leader inside `LogWriter` batches their records together without needing exclusive access to `mu`.
+
+#### `memMu sync.RWMutex` — SkipList lock
+
+`memMu` serialises access to the active SkipList. It is always acquired **inside** `mu` (i.e., with `mu` already held).
+
+| Operation | Lock held |
+|-----------|-----------|
+| SkipList insert (`Put`, `Delete`) | Write lock (`memMu.Lock`) |
+| SkipList lookup (`Get`) | Read lock (`memMu.RLock`) |
+| SkipList scan (`Scan`) | Read lock (`memMu.RLock`) |
+
+### Lock ordering rule
+
+> **Always acquire `mu` before `memMu`.** Never acquire `mu` while holding `memMu`.
+
+### Why this design
+
+The WAL uses write-stealing so multiple `Put` goroutines can overlap their WAL appends under `mu.RLock()` — only one becomes the leader per batch, but the others' data is piggybacked into the same `file.Write` + `fsync`. After the WAL confirms durability, each goroutine independently acquires `memMu.Lock()` to insert its record into the SkipList. Because SkipList inserts are fast (in-memory, O(log n)), the window of exclusive `memMu` contention is brief.
+
+This split means the expensive operation (WAL I/O with `fsync`) is parallelised, while the cheap operation (SkipList insert) is serialised only as long as necessary.
 
 ### Background flush goroutine
 
@@ -300,17 +323,16 @@ Reads are fully concurrent with each other. A write blocks all reads, but only f
 
 Only one flush can be in progress at a time (`immutable == nil` guard in `Put`/`Delete`). If the memtable exceeds the threshold while a flush is running, writes continue into the active memtable. A second freeze is deferred until the first flush completes.
 
-### WAL async batch writer
+### WAL write-stealing leader election
 
-The `LogWriter` runs a single background goroutine (`runFlusher`):
+Each `Append` caller enqueues its `LogEntry` and then races to acquire the internal leader mutex:
 
-1. Block on `reqChan` waiting for the first request.
-2. Non-blockingly drain up to 1 024 requests into a batch.
-3. Write all records in the batch sequentially.
-4. Call `file.Sync()` once.
-5. Signal every request's `errChan` with the write result.
+1. The **leader** (winner) drains all currently enqueued requests into a single buffer.
+2. It calls `file.Write` once for the entire batch, then `file.Sync()`.
+3. It signals each request's completion channel with the write result.
+4. Goroutines that lost the race (followers) simply wait on their completion channel — their records were already written by the leader.
 
-Each `Append` call blocks on its personal `errChan` until the batch is committed. This gives per-call durability guarantees while amortising `fsync` cost across concurrent writes.
+This eliminates a dedicated flusher goroutine and the channel round-trip latency associated with it, cutting sequential write latency by ~35–51%.
 
 ### `bgErr` error propagation
 
@@ -422,7 +444,7 @@ SSTable file names are `<unix-nanosecond-timestamp>.sst`, which guarantees monot
 | `src/memtable/skip_list.go` | `SkipList` (max height 12) + `skipListIterator` | [src/memtable/README.md](../src/memtable/README.md) |
 | `src/wal/wal.go` | `LogWriterI` and `LogReaderI` interfaces | [src/wal/README.md](../src/wal/README.md) |
 | `src/wal/dto.go` | `LogEntry` data transfer object | [src/wal/README.md](../src/wal/README.md) |
-| `src/wal/writer.go` | `LogWriter` — async batch writer with group commit | [src/wal/README.md](../src/wal/README.md) |
+| `src/wal/writer.go` | `LogWriter` — write-stealing leader election for low-latency durable batch writes | [src/wal/README.md](../src/wal/README.md) |
 | `src/wal/reader.go` | `LogReader` — sequential decoder, crash-safe EOF | [src/wal/README.md](../src/wal/README.md) |
 | `src/sstable/sstable.go` | `BlockHandle`, `Footer`, `BlockSize`, `FooterSize` constants | [src/sstable/README.md](../src/sstable/README.md) |
 | `src/sstable/bloom.go` | `BloomFilter` — double-hashing FNV, encode/decode | [src/sstable/README.md](../src/sstable/README.md) |

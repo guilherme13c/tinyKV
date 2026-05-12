@@ -9,7 +9,11 @@ type MemTableI interface {
 	// Lookup returns (value, found, isTombstone). Does not collapse tombstones into errors.
 	Lookup(key []byte) (value []byte, found bool, isTombstone bool)
 	SizeInBytes() int
+	Len() int
 	Iterator() MemTableIteratorI
+	// Release returns the arena slab to the pool. The MemTable must not be
+	// used after Release is called.
+	Release()
 }
 
 type MemTableIteratorI interface {

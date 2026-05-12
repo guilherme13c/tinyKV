@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,12 +22,31 @@ type writeRequest struct {
 	errChan     chan error
 }
 
+// LogWriter uses a write-stealing leader-election scheme.
+//
+// Every caller of Append enqueues its request and then competes for mu.
+// The winner (leader) drains ALL pending requests — including those from
+// goroutines that were blocked waiting for mu — serialises them into a
+// single buffer, and issues one file.Write syscall for the entire batch.
+// Each stolen goroutine's errChan is signalled by the leader, so it can
+// return without ever touching the file itself.
+//
+// Lock ordering: pendingMu is always acquired while mu is held.
+// syncLoop only calls file.Sync and never acquires either lock.
 type LogWriter struct {
-	file         *os.File
-	reqChan      chan *writeRequest
-	doneChan     chan struct{}
-	wg           sync.WaitGroup
+	file     *os.File
+	mu       sync.Mutex      // leader-election lock
+	pendingMu sync.Mutex     // guards pending slice
+	pending  []*writeRequest // queue of waiting writers
+	batchBuf []*writeRequest // scratch batch buffer; owned by leader under mu
+	writeBuf []byte          // scratch write buffer; owned by leader under mu
+
+	closed   atomic.Bool
+	doneChan chan struct{}
+	wg       sync.WaitGroup
+
 	syncInterval time.Duration
+	reqPool      sync.Pool
 }
 
 func NewWriter(path string) (*LogWriter, error) {
@@ -37,109 +57,126 @@ func NewWriter(path string) (*LogWriter, error) {
 
 	lw := &LogWriter{
 		file:         f,
-		reqChan:      make(chan *writeRequest, 1024),
+		pending:      make([]*writeRequest, 0, 64),
+		batchBuf:     make([]*writeRequest, 0, 64),
+		writeBuf:     make([]byte, 0, 64*1024),
 		doneChan:     make(chan struct{}),
 		syncInterval: DefaultSyncInterval,
+		reqPool: sync.Pool{
+			New: func() any {
+				return &writeRequest{errChan: make(chan error, 1)}
+			},
+		},
 	}
 
 	lw.wg.Add(1)
-	go lw.runFlusher()
+	go lw.syncLoop()
 
 	return lw, nil
 }
 
 func (lw *LogWriter) Append(key []byte, value []byte, isTombstone bool) error {
-	req := &writeRequest{
-		key:         key,
-		value:       value,
-		isTombstone: isTombstone,
-		errChan:     make(chan error, 1),
-	}
-
-	select {
-	case lw.reqChan <- req:
-		// Wait for the result, but also watch for Close so we don't deadlock
-		// if the goroutine exits before it processes this request.
-		select {
-		case err := <-req.errChan:
-			return err
-		case <-lw.doneChan:
-			return os.ErrClosed
-		}
-	case <-lw.doneChan:
+	if lw.closed.Load() {
 		return os.ErrClosed
 	}
+
+	req := lw.reqPool.Get().(*writeRequest)
+	req.key = key
+	req.value = value
+	req.isTombstone = isTombstone
+
+	// Enqueue BEFORE acquiring mu.  Any leader that drains after this point
+	// is guaranteed to see our request — so our errChan will always be
+	// signalled exactly once.
+	lw.pendingMu.Lock()
+	lw.pending = append(lw.pending, req)
+	lw.pendingMu.Unlock()
+
+	// Compete to become the leader.  Goroutines that lose wait here; by the
+	// time they win, the previous leader may have already processed their
+	// request (write-stealing).
+	lw.mu.Lock()
+
+	if lw.closed.Load() {
+		// Writer was closed while we waited.  Drain pending (including ours)
+		// and signal ErrClosed to everyone.
+		lw.pendingMu.Lock()
+		for _, r := range lw.pending {
+			r.errChan <- os.ErrClosed
+		}
+		lw.pending = lw.pending[:0]
+		lw.pendingMu.Unlock()
+		lw.mu.Unlock()
+
+		err := <-req.errChan
+		lw.reqPool.Put(req)
+		return err
+	}
+
+	// Drain all pending writers (ours plus any that arrived while we waited).
+	lw.pendingMu.Lock()
+	lw.batchBuf = append(lw.batchBuf[:0], lw.pending...)
+	lw.pending = lw.pending[:0]
+	lw.pendingMu.Unlock()
+
+	// batchBuf may be empty if a previous leader already stole our request.
+	var writeErr error
+	if len(lw.batchBuf) > 0 {
+		lw.writeBuf = lw.writeBuf[:0]
+		for _, r := range lw.batchBuf {
+			lw.writeBuf = appendRecord(lw.writeBuf, r)
+		}
+		if _, err := lw.file.Write(lw.writeBuf); err != nil {
+			writeErr = err
+		}
+		for _, r := range lw.batchBuf {
+			r.errChan <- writeErr
+		}
+	}
+
+	lw.mu.Unlock()
+
+	err := <-req.errChan
+	lw.reqPool.Put(req)
+	return err
 }
 
 func (lw *LogWriter) Close() error {
 	close(lw.doneChan)
 	lw.wg.Wait()
+
+	// Acquire the leader lock so that: (a) any in-flight leader finishes
+	// before we proceed, and (b) setting closed and draining pending is atomic
+	// from the perspective of racing Append callers.
+	lw.mu.Lock()
+	lw.closed.Store(true)
+	lw.pendingMu.Lock()
+	for _, r := range lw.pending {
+		r.errChan <- os.ErrClosed
+	}
+	lw.pending = lw.pending[:0]
+	lw.pendingMu.Unlock()
+	lw.mu.Unlock()
+
 	if err := lw.file.Sync(); err != nil {
 		return err
 	}
 	return lw.file.Close()
 }
 
-func (lw *LogWriter) runFlusher() {
+// syncLoop periodically calls file.Sync to push OS page-cache data to
+// durable storage.  It does not hold any write lock, so it never blocks
+// concurrent Append calls.
+func (lw *LogWriter) syncLoop() {
 	defer lw.wg.Done()
-
-	batch := make([]*writeRequest, 0, 1024)
-	// Pre-allocated scratch buffer for batch writes (Fix 2: single Write per batch).
-	writeBuf := make([]byte, 0, 64*1024)
-
-	// Fix 1: sync on a ticker instead of after every batch.
-	syncTicker := time.NewTicker(lw.syncInterval)
-	defer syncTicker.Stop()
-
+	ticker := time.NewTicker(lw.syncInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-lw.doneChan:
-			// Drain any requests that were queued before the close signal.
-			for {
-				select {
-				case req := <-lw.reqChan:
-					req.errChan <- os.ErrClosed
-				default:
-					return
-				}
-			}
-
-		case <-syncTicker.C:
-			// Periodic durability flush — push OS page-cache data to disk.
+			return
+		case <-ticker.C:
 			_ = lw.file.Sync()
-
-		case req := <-lw.reqChan:
-			batch = append(batch, req)
-
-		drainLoop:
-			for len(batch) < 1024 {
-				select {
-				case nextReq := <-lw.reqChan:
-					batch = append(batch, nextReq)
-				default:
-					break drainLoop
-				}
-			}
-
-			// Fix 2: serialise all records into one buffer and issue a
-			// single Write() syscall for the entire batch.
-			writeBuf = writeBuf[:0]
-			for _, r := range batch {
-				writeBuf = appendRecord(writeBuf, r)
-			}
-
-			var writeErr error
-			if _, err := lw.file.Write(writeBuf); err != nil {
-				writeErr = err
-			}
-
-			// Notify callers: data is in the OS page cache.
-			// The sync ticker will flush it to durable storage.
-			for _, r := range batch {
-				r.errChan <- writeErr
-			}
-
-			batch = batch[:0]
 		}
 	}
 }

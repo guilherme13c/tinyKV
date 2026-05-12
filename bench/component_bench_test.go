@@ -101,7 +101,7 @@ func BenchmarkSSTBulkWrite(b *testing.B) {
 		b.Run(fmt.Sprintf("val=%dB", vs), func(b *testing.B) {
 			dir := b.TempDir()
 			path := filepath.Join(dir, "bench.sst")
-			sw, err := sstable.NewWriter(path)
+			sw, err := sstable.NewWriter(path, 0)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -133,7 +133,7 @@ func BenchmarkSSTGet(b *testing.B) {
 			path := filepath.Join(dir, "bench.sst")
 
 			// Build the SSTable once.
-			sw, err := sstable.NewWriter(path)
+			sw, err := sstable.NewWriter(path, 0)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -172,7 +172,7 @@ func BenchmarkSSTGetMiss(b *testing.B) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench.sst")
 
-	sw, err := sstable.NewWriter(path)
+	sw, err := sstable.NewWriter(path, 0)
 	if err != nil {
 		b.Fatal(err)
 	}
