@@ -3,3 +3,4 @@ bench.test
 bench/results/
 *.pprof
 compare/cpp_bench/
+HANDOUT.md
