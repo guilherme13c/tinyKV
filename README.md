@@ -15,7 +15,7 @@ Built to be readable first and to illustrate the core ideas behind production st
 - **Full L0 compaction** — tombstone-safe merge of all SSTables
 - **Crash recovery** — WAL replay on startup, including interrupted flushes
 - **Interactive REPL** and non-interactive (pipe) modes
-- Zero external dependencies — pure Go stdlib
+- Minimal external dependencies — one tiny package ([`xxhash`](https://github.com/cespare/xxhash)) for bloom-filter hashing; no generated code or encoding libraries
 
 ---
 
@@ -156,32 +156,32 @@ All results: Intel Core i7-1165G7 @ 2.80GHz, linux/amd64, 8 logical cores, `-ben
 
 #### Writes
 
-| Operation        | tinyKV          | LevelDB     | RocksDB     | vs LevelDB | vs RocksDB |
-| ---------------- | --------------- | ----------- | ----------- | ---------- | ---------- |
-| `put` sequential | 4,017 ns/op     | 2,621 ns/op | 4,666 ns/op | −35%       | **+14%**   |
-| `put` random     | 4,335 ns/op     | 3,355 ns/op | 6,997 ns/op | −23%       | **+38%**   |
-| `delete`         | **2,377 ns/op** | 2,554 ns/op | 5,594 ns/op | **+7%**    | **+57%**   |
-| concurrent `put` | 4,494 ns/op     | 4,356 ns/op | 5,586 ns/op | −3%        | **+19%**   |
+| Operation        | tinyKV          | LevelDB      | RocksDB      | vs LevelDB | vs RocksDB |
+| ---------------- | --------------- | ------------ | ------------ | ---------- | ---------- |
+| `put` sequential | **6,503 ns/op** | 9,124 ns/op  | 8,879 ns/op  | **+40%**   | **+37%**   |
+| `put` random     | 14,795 ns/op    | 7,282 ns/op  | 12,400 ns/op | −51%       | −16%       |
+| `delete`         | 3,190 ns/op     | 3,141 ns/op  | 8,703 ns/op  | −2%        | **+173%**  |
+| concurrent `put` | **5,761 ns/op** | 6,264 ns/op  | 12,029 ns/op | **+9%**    | **+109%**  |
 
-tinyKV beats LevelDB on deletes and beats RocksDB on every write operation. The write path bottleneck vs. LevelDB is key-comparison overhead in the SkipList (`bytes.Compare` vs. LevelDB's inlined comparator).
+tinyKV wins sequential puts, concurrent puts, and deletes against RocksDB by a wide margin. Against LevelDB, sequential puts (+40%) and concurrent puts (+9%) favour tinyKV; random puts are slower because the SkipList's pointer-chasing access pattern causes more cache misses than LevelDB's sorted-block layout at a 10 M-key keyspace.
 
 #### Reads
 
-| Operation            | tinyKV        | LevelDB   | RocksDB     | vs LevelDB | vs RocksDB |
-| -------------------- | ------------- | --------- | ----------- | ---------- | ---------- |
-| `get` hot (memtable) | **189 ns/op** | 546 ns/op | 1,732 ns/op | **+189%**  | **+817%**  |
-| `get` cold (SSTable) | **844 ns/op** | 941 ns/op | 5,010 ns/op | **+11%**   | **+494%**  |
-| `get` miss (bloom)   | **122 ns/op** | 233 ns/op | 540 ns/op   | **+91%**   | **+343%**  |
+| Operation            | tinyKV          | LevelDB      | RocksDB      | vs LevelDB | vs RocksDB |
+| -------------------- | --------------- | ------------ | ------------ | ---------- | ---------- |
+| `get` hot (memtable) | **393 ns/op**   | 1,055 ns/op  | 2,449 ns/op  | **+168%**  | **+523%**  |
+| `get` cold (SSTable) | **1,214 ns/op** | 2,021 ns/op  | 9,488 ns/op  | **+66%**   | **+681%**  |
+| `get` miss (bloom)   | **200.8 ns/op** | 431.1 ns/op  | 853.5 ns/op  | **+115%**  | **+325%**  |
 
-tinyKV dominates reads across all three scenarios. Hot reads are **2.9× faster than LevelDB** and **9.2× faster than RocksDB** — the CGO boundary adds hundreds of nanoseconds on every call; tinyKV is a direct Go function call. Cold reads are still 11% ahead of LevelDB.
+tinyKV dominates reads across all three scenarios. Hot reads are **2.7× faster than LevelDB** and **6.2× faster than RocksDB** — the CGO boundary adds hundreds of nanoseconds on every call; tinyKV is a direct Go function call. Cold reads are **66% faster than LevelDB** and **7.8× faster than RocksDB**. Bloom-filter misses are **2.1× faster than LevelDB** thanks to xxHash64's throughput advantage.
 
 #### Scans
 
-| Range size  | tinyKV        | LevelDB    | RocksDB    | vs LevelDB | vs RocksDB |
-| ----------- | ------------- | ---------- | ---------- | ---------- | ---------- |
-| 100 keys    | **11,616 ns** | 44,543 ns  | 85,382 ns  | **+283%**  | **+635%**  |
-| 1,000 keys  | **92,828 ns** | 370,747 ns | 799,150 ns | **+299%**  | **+761%**  |
-| 10,000 keys | **811 µs**    | 3,304 µs   | 7,390 µs   | **+307%**  | **+811%**  |
+| Range size  | tinyKV          | LevelDB      | RocksDB       | vs LevelDB | vs RocksDB |
+| ----------- | --------------- | ------------ | ------------- | ---------- | ---------- |
+| 100 keys    | **15,632 ns**   | 55,526 ns    | 116,650 ns    | **+255%**  | **+646%**  |
+| 1,000 keys  | **127 µs**      | 503 µs       | 1,220 µs      | **+296%**  | **+861%**  |
+| 10,000 keys | **1,138 µs**    | 5,249 µs     | 11,485 µs     | **+361%**  | **+909%**  |
 
 Scan allocs/op: tinyKV **13** (constant); LevelDB/RocksDB **202 / 201 per 100 keys** (one allocation per returned entry via CGO). tinyKV's merge iterator pre-allocates the heap once and reuses it for the entire range.
 
@@ -191,11 +191,11 @@ Scan allocs/op: tinyKV **13** (constant); LevelDB/RocksDB **202 / 201 per 100 ke
 
 > `put` sequential, key fixed at 16 B.
 
-| Value size | ns/op  | Throughput | Allocs/op |
-| ---------- | ------ | ---------- | --------- |
-| 64 B       | 3,622  | 22 MB/s    | 1         |
-| 1 KB       | 11,306 | 92 MB/s    | 2         |
-| 16 KB      | 82,362 | 199 MB/s   | 3         |
+| Value size | ns/op   | Throughput | Allocs/op |
+| ---------- | ------- | ---------- | --------- |
+| 64 B       | 6,146   | 13 MB/s    | 1         |
+| 1 KB       | 20,451  | 51 MB/s    | 2         |
+| 16 KB      | 100,776 | 163 MB/s   | 4         |
 
 Write cost grows sub-linearly with value size — the WAL write-stealing leader batches concurrent payloads into a single `file.Write()`, amortising syscall overhead across goroutines.
 
@@ -203,14 +203,14 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 ### Read latency breakdown (tinyKV, by key size)
 
-| Scenario             | key=16 B | key=64 B | key=256 B | Allocs/op |
-| -------------------- | -------- | -------- | --------- | --------- |
-| **Hot** (memtable)   | 249 ns   | 237 ns   | 360 ns    | 0         |
-| **Cold** (SSTable)   | 864 ns   | 980 ns   | 1,455 ns  | 1–2       |
-| **Miss** (not found) | 241 ns   | 223 ns   | 668 ns    | 2         |
+| Scenario             | key=16 B  | key=64 B  | key=256 B | Allocs/op |
+| -------------------- | --------- | --------- | --------- | --------- |
+| **Hot** (memtable)   | 347 ns    | 332 ns    | 485 ns    | 0         |
+| **Cold** (SSTable)   | 1,286 ns  | 1,593 ns  | 997 ns    | 1–2       |
+| **Miss** (not found) | 143 ns    | 141 ns    | 160 ns    | 2         |
 
 **Hot reads** hit the SkipList under a shared read-lock — no allocation, no I/O.  
-**Cold reads** add one SSTable binary-search + bloom-filter probe (~700 ns extra).  
+**Cold reads** add one SSTable binary-search + bloom-filter probe (~700–1,200 ns extra).  
 **Misses** short-circuit at the bloom filter before any disk access.
 
 ---
@@ -219,9 +219,9 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 | Range size  | ns/op   | Throughput | Allocs/op |
 | ----------- | ------- | ---------- | --------- |
-| 100 keys    | 11,616  | 689 MB/s   | 13        |
-| 1,000 keys  | 92,828  | 862 MB/s   | 13        |
-| 10,000 keys | 811,114 | 986 MB/s   | 13        |
+| 100 keys    | 10,173  | 786 MB/s   | 12        |
+| 1,000 keys  | 87,821  | 911 MB/s   | 12        |
+| 10,000 keys | 848,623 | 943 MB/s   | 12        |
 
 Alloc count stays constant regardless of range size — the merge iterator heap is allocated once per `Scan` call.
 
@@ -231,7 +231,7 @@ Alloc count stays constant regardless of range size — the merge iterator heap 
 
 | Operation    | Allocs/op | Notes                                     |
 | ------------ | --------- | ----------------------------------------- |
-| `put`        | 1–3       | Arena-pooled slab; 1 alloc per key copy   |
+| `put`        | 1–4       | Arena-pooled slab; 1 alloc per key copy   |
 | `get` (hot)  | 0         | Returns slice into arena; zero allocation |
 | `get` (cold) | 1–2       | One slice for the decoded value           |
 | `delete`     | 1         | Tombstone key copy only                   |
