@@ -33,7 +33,7 @@ This design trades some read complexity for extremely fast sequential writes: ev
 
 tinyKV intentionally keeps each component minimal and independently readable:
 
-- No external dependencies (pure stdlib Go).
+- Minimal external dependencies: only [`github.com/cespare/xxhash/v2`](https://github.com/cespare/xxhash) for the bloom-filter hash (single-file, zero transitive deps).
 - Each package maps to exactly one LSM-tree concept.
 - All interfaces are small — usually two to four methods.
 - All on-disk formats are documented and hand-written (no protobuf, no encoding libraries).

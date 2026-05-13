@@ -122,7 +122,7 @@ flushBlock()          ← flush the last partial data block
 writeIndexBlock()     ← write index, capture IndexHandle
 writeBloomBlock()     ← write bloom, capture BloomHandle
 returnBloomBufs()     ← reset pooledBufs and return to bloomBufPool
-writeFooter(...)      ← write 32-byte footer
+writeFooter(...)      ← write 33-byte footer (handles + FormatVersion)
 file.Sync()           ← fsync: ensure data reaches disk
 file.Close()
 ```
@@ -197,13 +197,14 @@ Returns a `BlockHandle` for the written bloom data.
 func (w *Writer) writeFooter(indexHandle, bloomHandle BlockHandle) error
 ```
 
-Writes the fixed 32-byte footer as eight `uint64` values in little-endian order:
+Writes the fixed **33-byte** footer:
 
 ```
 bytes  0– 7:  indexHandle.Offset
 bytes  8–15:  indexHandle.Length
 bytes 16–23:  bloomHandle.Offset
 bytes 24–31:  bloomHandle.Length
+byte  32:     FormatVersion (0x02)
 ```
 
 ---

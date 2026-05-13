@@ -68,6 +68,11 @@ func NewReader(path string) (*Reader, error) {
 		},
 	}
 
+	if footerBuf[32] != FormatVersion {
+		_ = f.Close()
+		return nil, fmt.Errorf("sstable: unsupported format version 0x%02x (want 0x%02x); delete old SSTable files and restart", footerBuf[32], FormatVersion)
+	}
+
 	bloomData := make([]byte, footer.BloomHandle.Length)
 	if _, err := f.ReadAt(bloomData, int64(footer.BloomHandle.Offset)); err != nil {
 		_ = f.Close()

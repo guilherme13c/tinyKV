@@ -93,6 +93,20 @@ Each slab is a `[]skipListNode` of length 65536 (≈ 7.3 MB). On creation, two s
 
 `Release()` is part of the `MemTableI` interface so the store can reclaim the arena immediately after a flush, before starting the next memtable.
 
+#### Per-SkipList PRNG
+
+Each `SkipList` owns a private `*rand.Rand` (from `math/rand/v2`, backed by a PCG generator) that is
+seeded from the global source at construction time:
+
+```go
+rng: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+```
+
+`randomHeight()` calls `sl.rng.IntN(2)` instead of the package-level `rand.Intn(2)`. The
+package-level source in `math/rand/v1` held a global mutex; every concurrent `Put` would serialise
+on it during the height roll. With per-instance PRNGs, concurrent writes to different SkipLists
+(e.g. active memtable vs. a compaction flush) never contend on the PRNG.
+
 #### Why a channel pool instead of `sync.Pool`?
 
 `sync.Pool` is cleared at every GC cycle. Because the store triggers a flush (and therefore arena reclamation) on a timer whose period aligns with GC pressure, using `sync.Pool` would cause slabs to be discarded precisely when they are most needed. A channel pool retains slabs **across GC pauses**, guaranteeing reuse regardless of collection timing.

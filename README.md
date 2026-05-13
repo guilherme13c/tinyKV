@@ -1,6 +1,6 @@
 # tinyKV
 
-A small, pedagogical [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) key-value store written in Go — no external dependencies, pure stdlib.
+A small, pedagogical [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) key-value store written in Go with minimal dependencies.
 
 Built to be readable first and to illustrate the core ideas behind production stores like LevelDB, RocksDB, and Cassandra — without the production complexity that makes those systems hard to learn from.
 
@@ -156,32 +156,32 @@ All results: Intel Core i7-1165G7 @ 2.80GHz, linux/amd64, 8 logical cores, `-ben
 
 #### Writes
 
-| Operation        | tinyKV          | LevelDB      | RocksDB      | vs LevelDB | vs RocksDB |
-| ---------------- | --------------- | ------------ | ------------ | ---------- | ---------- |
-| `put` sequential | **6,503 ns/op** | 9,124 ns/op  | 8,879 ns/op  | **+40%**   | **+37%**   |
-| `put` random     | 14,795 ns/op    | 7,282 ns/op  | 12,400 ns/op | −51%       | −16%       |
-| `delete`         | 3,190 ns/op     | 3,141 ns/op  | 8,703 ns/op  | −2%        | **+173%**  |
-| concurrent `put` | **5,761 ns/op** | 6,264 ns/op  | 12,029 ns/op | **+9%**    | **+109%**  |
+| Operation        | tinyKV          | LevelDB     | RocksDB      | vs LevelDB | vs RocksDB |
+| ---------------- | --------------- | ----------- | ------------ | ---------- | ---------- |
+| `put` sequential | **6,503 ns/op** | 9,124 ns/op | 8,879 ns/op  | **+40%**   | **+37%**   |
+| `put` random     | 14,795 ns/op    | 7,282 ns/op | 12,400 ns/op | −51%       | −16%       |
+| `delete`         | 3,190 ns/op     | 3,141 ns/op | 8,703 ns/op  | −2%        | **+173%**  |
+| concurrent `put` | **5,761 ns/op** | 6,264 ns/op | 12,029 ns/op | **+9%**    | **+109%**  |
 
 tinyKV wins sequential puts, concurrent puts, and deletes against RocksDB by a wide margin. Against LevelDB, sequential puts (+40%) and concurrent puts (+9%) favour tinyKV; random puts are slower because the SkipList's pointer-chasing access pattern causes more cache misses than LevelDB's sorted-block layout at a 10 M-key keyspace.
 
 #### Reads
 
-| Operation            | tinyKV          | LevelDB      | RocksDB      | vs LevelDB | vs RocksDB |
-| -------------------- | --------------- | ------------ | ------------ | ---------- | ---------- |
-| `get` hot (memtable) | **393 ns/op**   | 1,055 ns/op  | 2,449 ns/op  | **+168%**  | **+523%**  |
-| `get` cold (SSTable) | **1,214 ns/op** | 2,021 ns/op  | 9,488 ns/op  | **+66%**   | **+681%**  |
-| `get` miss (bloom)   | **200.8 ns/op** | 431.1 ns/op  | 853.5 ns/op  | **+115%**  | **+325%**  |
+| Operation            | tinyKV          | LevelDB     | RocksDB     | vs LevelDB | vs RocksDB |
+| -------------------- | --------------- | ----------- | ----------- | ---------- | ---------- |
+| `get` hot (memtable) | **393 ns/op**   | 1,055 ns/op | 2,449 ns/op | **+168%**  | **+523%**  |
+| `get` cold (SSTable) | **1,214 ns/op** | 2,021 ns/op | 9,488 ns/op | **+66%**   | **+681%**  |
+| `get` miss (bloom)   | **200.8 ns/op** | 431.1 ns/op | 853.5 ns/op | **+115%**  | **+325%**  |
 
 tinyKV dominates reads across all three scenarios. Hot reads are **2.7× faster than LevelDB** and **6.2× faster than RocksDB** — the CGO boundary adds hundreds of nanoseconds on every call; tinyKV is a direct Go function call. Cold reads are **66% faster than LevelDB** and **7.8× faster than RocksDB**. Bloom-filter misses are **2.1× faster than LevelDB** thanks to xxHash64's throughput advantage.
 
 #### Scans
 
-| Range size  | tinyKV          | LevelDB      | RocksDB       | vs LevelDB | vs RocksDB |
-| ----------- | --------------- | ------------ | ------------- | ---------- | ---------- |
-| 100 keys    | **15,632 ns**   | 55,526 ns    | 116,650 ns    | **+255%**  | **+646%**  |
-| 1,000 keys  | **127 µs**      | 503 µs       | 1,220 µs      | **+296%**  | **+861%**  |
-| 10,000 keys | **1,138 µs**    | 5,249 µs     | 11,485 µs     | **+361%**  | **+909%**  |
+| Range size  | tinyKV        | LevelDB   | RocksDB    | vs LevelDB | vs RocksDB |
+| ----------- | ------------- | --------- | ---------- | ---------- | ---------- |
+| 100 keys    | **15,632 ns** | 55,526 ns | 116,650 ns | **+255%**  | **+646%**  |
+| 1,000 keys  | **127 µs**    | 503 µs    | 1,220 µs   | **+296%**  | **+861%**  |
+| 10,000 keys | **1,138 µs**  | 5,249 µs  | 11,485 µs  | **+361%**  | **+909%**  |
 
 Scan allocs/op: tinyKV **13** (constant); LevelDB/RocksDB **202 / 201 per 100 keys** (one allocation per returned entry via CGO). tinyKV's merge iterator pre-allocates the heap once and reuses it for the entire range.
 
@@ -203,11 +203,11 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 ### Read latency breakdown (tinyKV, by key size)
 
-| Scenario             | key=16 B  | key=64 B  | key=256 B | Allocs/op |
-| -------------------- | --------- | --------- | --------- | --------- |
-| **Hot** (memtable)   | 347 ns    | 332 ns    | 485 ns    | 0         |
-| **Cold** (SSTable)   | 1,286 ns  | 1,593 ns  | 997 ns    | 1–2       |
-| **Miss** (not found) | 143 ns    | 141 ns    | 160 ns    | 2         |
+| Scenario             | key=16 B | key=64 B | key=256 B | Allocs/op |
+| -------------------- | -------- | -------- | --------- | --------- |
+| **Hot** (memtable)   | 347 ns   | 332 ns   | 485 ns    | 0         |
+| **Cold** (SSTable)   | 1,286 ns | 1,593 ns | 997 ns    | 1–2       |
+| **Miss** (not found) | 143 ns   | 141 ns   | 160 ns    | 2         |
 
 **Hot reads** hit the SkipList under a shared read-lock — no allocation, no I/O.  
 **Cold reads** add one SSTable binary-search + bloom-filter probe (~700–1,200 ns extra).  

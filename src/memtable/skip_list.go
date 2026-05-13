@@ -2,7 +2,7 @@ package memtable
 
 import (
 	"bytes"
-	"math/rand"
+	"math/rand/v2"
 
 	src "github.com/guilherme13c/tinyKV/src"
 )
@@ -38,6 +38,7 @@ type SkipList struct {
 	keyCount  int
 	arena     []skipListNode
 	arenaTop  int
+	rng       *rand.Rand
 }
 
 func NewSkipList() *SkipList {
@@ -49,7 +50,11 @@ func NewSkipList() *SkipList {
 	}
 
 	// Slots 0 and 1 are reserved for tail and head.
-	sl := &SkipList{arena: slab, arenaTop: 2}
+	sl := &SkipList{
+		arena:    slab,
+		arenaTop: 2,
+		rng:      rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+	}
 	sl.tail = &slab[0]
 	sl.head = &slab[1]
 
@@ -95,7 +100,7 @@ func (sl *SkipList) Release() {
 // randomHeight returns a height in [0, SkipListMaxHeight-1].
 func (sl *SkipList) randomHeight() int {
 	height := 0
-	for rand.Intn(2) == 1 && height < SkipListMaxHeight-1 {
+	for sl.rng.IntN(2) == 1 && height < SkipListMaxHeight-1 {
 		height++
 	}
 	return height

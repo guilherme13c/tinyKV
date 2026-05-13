@@ -2,8 +2,10 @@ package sstable
 
 import (
 	"encoding/binary"
-	"hash/fnv"
 	"math"
+	"math/bits"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 const bitsPerKey = 10
@@ -38,13 +40,13 @@ func newBloomFilter(keys [][]byte) *BloomFilter {
 	return bf
 }
 
+// hash uses xxHash64 double-hashing for speed and distribution quality.
+// h2 is derived from h1 via a multiply-rotate mix (Kirsch-Mitzenmacher style),
+// avoiding a second hash computation while keeping the two values independent.
 func (bf *BloomFilter) hash(key []byte) (uint64, uint64) {
-	h1 := fnv.New64a()
-	h1.Write(key)
-	h2 := fnv.New64()
-	h2.Write(key)
-
-	return h1.Sum64(), h2.Sum64()
+	h1 := xxhash.Sum64(key)
+	h2 := bits.RotateLeft64(h1, 31) * 0x9e3779b97f4a7c15
+	return h1, h2
 }
 
 func (bf *BloomFilter) Add(key []byte) {

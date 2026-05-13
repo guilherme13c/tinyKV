@@ -4,7 +4,7 @@ package sstable
 const (
 	BlockSize       = 4096 // 4Kb
 	FooterSize      = 33   // 32 bytes (4 uint64 handles) + 1 byte format version
-	FormatVersion   = 0x01 // v1: restart-point blocks + inline bloom filter build
+	FormatVersion   = 0x02 // v2: xxHash64 bloom filter (v1 used FNV64)
 	RestartInterval = 16   // one restart point every N entries
 )
 

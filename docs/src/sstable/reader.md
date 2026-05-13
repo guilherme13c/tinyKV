@@ -57,16 +57,18 @@ func NewReader(path string) (*Reader, error)
 ```
 1.  os.OpenFile(path, O_RDONLY, 0)
 2.  file.Stat()  →  get file size
-3.  Validate: size >= FooterSize (32)  →  error if not
-4.  file.ReadAt(buf[32], size−32)   →  read footer bytes
+3.  Validate: size >= FooterSize (33)  →  error if not
+4.  file.ReadAt(buf[33], size−33)   →  read footer bytes
 5.  Parse Footer:
       IndexHandle = {LE64(buf[0:8]),  LE64(buf[8:16])}
       BloomHandle = {LE64(buf[16:24]), LE64(buf[24:32])}
+5a. Check buf[32] == FormatVersion (0x02)  →  error if not
+      (prevents silent wrong results when bloom hash changes across versions)
 6.  file.ReadAt(bloomData, BloomHandle.Offset)  →  read bloom block
 7.  DecodeBloom(bloomData)  →  BloomFilter in memory
 8.  file.ReadAt(indexData, IndexHandle.Offset)  →  read index block
 9.  parseIndexBlock(indexData)  →  []indexEntry in memory
-10. Return &Reader{file, index, bloom}
+10. Return &Reader{file, index, bloom, blockPool}
 ```
 
 On **any error** in steps 2–9, the file is closed before returning (`_ = f.Close()`). The caller never receives a `Reader` with a leaked file descriptor.

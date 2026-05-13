@@ -3,7 +3,9 @@ package sstable_test
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	src "github.com/guilherme13c/tinyKV/src"
@@ -301,6 +303,47 @@ func TestSSTPath(t *testing.T) {
 
 	if r.Path() != path {
 		t.Errorf("Path(): got %q, want %q", r.Path(), path)
+	}
+}
+
+func TestSSTVersionMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v1.sst")
+
+	w, err := sstable.NewWriter(path, 0)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Append([]byte("k"), []byte("v"), false); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Overwrite the format-version byte (last byte of the file) with 0x01
+	// to simulate a v1 SSTable written with the old FNV-based bloom filter.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		t.Fatalf("stat: %v", err)
+	}
+	if _, err := f.WriteAt([]byte{0x01}, info.Size()-1); err != nil {
+		f.Close()
+		t.Fatalf("WriteAt version byte: %v", err)
+	}
+	f.Close()
+
+	_, err = sstable.NewReader(path)
+	if err == nil {
+		t.Fatal("expected error for version mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported format version") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
