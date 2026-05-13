@@ -30,9 +30,11 @@ An in-memory representation of one entry from the index block.
 
 ```go
 type Reader struct {
-    file  *os.File
-    index []indexEntry
-    bloom *BloomFilter
+    file      *os.File
+    index     []indexEntry
+    bloom     *BloomFilter
+    blockPool sync.Pool
+    cache     BlockCache
 }
 ```
 
@@ -41,15 +43,32 @@ type Reader struct {
 | `file` | The open file descriptor. Kept open for the lifetime of the `Reader` to serve `ReadAt` calls. |
 | `index` | Slice of `indexEntry` values, one per data block, loaded entirely into memory at open time. |
 | `bloom` | The deserialized `BloomFilter`, loaded entirely into memory at open time. |
+| `blockPool` | `sync.Pool` of reusable `[]byte` buffers used for disk reads. Avoids per-read heap allocations on cache misses. |
+| `cache` | Optional block cache shared across all readers. `nil` when caching is disabled. |
 
 Both `index` and `bloom` are held in memory for the life of the `Reader`, so every `Get` call can perform the bloom check and binary search without any file I/O.
+
+---
+
+## `BlockCache` Interface
+
+```go
+type BlockCache interface {
+    GetBlock(path string, offset uint64) ([]byte, bool)
+    PutBlock(path string, offset uint64, data []byte)
+}
+```
+
+Implemented by `store.blockCache`. Defined in the `sstable` package to avoid a circular import (`store` imports `sstable`; `sstable` must not import `store`).
+
+Pass `nil` to `NewReader` to disable block caching (used in tests and standalone benchmarks).
 
 ---
 
 ## `NewReader`
 
 ```go
-func NewReader(path string) (*Reader, error)
+func NewReader(path string, cache BlockCache) (*Reader, error)
 ```
 
 **Full open sequence:**
@@ -68,7 +87,7 @@ func NewReader(path string) (*Reader, error)
 7.  DecodeBloom(bloomData)  →  BloomFilter in memory
 8.  file.ReadAt(indexData, IndexHandle.Offset)  →  read index block
 9.  parseIndexBlock(indexData)  →  []indexEntry in memory
-10. Return &Reader{file, index, bloom, blockPool}
+10. Return &Reader{file, index, bloom, blockPool, cache}
 ```
 
 On **any error** in steps 2–9, the file is closed before returning (`_ = f.Close()`). The caller never receives a `Reader` with a leaked file descriptor.
@@ -130,29 +149,28 @@ The search finds the **leftmost** index entry whose `lastKey >= key`. Because th
 ### Tier 3 — Block read + linear scan
 
 ```go
-data, err := r.readBlock(r.index[blockIdx].handle)
+data, bp, err := r.readCachedBlock(r.index[blockIdx].handle)
 // ...
-return scanBlock(data, key)
+result, scanErr := scanBlock(data, key)
+if bp != nil { r.blockPool.Put(bp) }
 ```
 
-Loads exactly one data block from disk and scans it linearly. See [`scanBlock`](#scanblock) below.
+Fetches the block via `readCachedBlock` (cache hit → no disk I/O; cache miss → one disk read) and scans it linearly. See [`readCachedBlock`](#readcachedblock) and [`scanBlock`](#scanblock) below.
 
 ---
 
-## `readBlock`
+## `readCachedBlock`
 
 ```go
-func (r *Reader) readBlock(handle BlockHandle) ([]byte, error)
+func (r *Reader) readCachedBlock(handle BlockHandle) (data []byte, poolBuf *[]byte, err error)
 ```
 
-Allocates a `[]byte` of `handle.Length` bytes and fills it with a single `ReadAt` call:
+Unified block-fetch helper used by both `Get` and `sstableIterator.loadBlock`:
 
-```go
-data := make([]byte, handle.Length)
-_, err := r.file.ReadAt(data, int64(handle.Offset))
-```
+1. **Cache hit** — if `r.cache != nil` and `GetBlock(path, offset)` succeeds, return the cached slice immediately. `poolBuf` is `nil`; the caller must not call `blockPool.Put`.
+2. **Cache miss** — acquire a pooled buffer from `blockPool`, fill it with a single `ReadAt` call (`readBlockInto`). If `r.cache != nil`, copy the block data into a fresh slice and call `PutBlock`. Return the pool buffer as `poolBuf`; the caller must call `r.blockPool.Put(poolBuf)` after use.
 
-No buffering or block cache is involved. Each call allocates fresh memory. See [trade-offs](#trade-offs-and-design-notes).
+The copy-on-store ensures the cache owns its slice independently of the pool buffer, so the pool buffer can be reused immediately after the scan without corrupting the cached entry.
 
 ---
 
@@ -270,7 +288,12 @@ type sstableIterator struct {
 func (it *sstableIterator) loadBlock(idx int) bool
 ```
 
-Reads block `idx` from disk into `it.blockData` and resets `it.blockPos` to 0. Returns `false` if `idx` is out of range or the read fails. On success, sets `it.blockIdx = idx`.
+Fetches block `idx` via `readCachedBlock` and populates `it.blockData`, `it.blockBuf`, `it.blockPos`, and `it.blockDataEnd`. Returns `false` if `idx` is out of range or the read fails.
+
+- If the block was served from the cache, `it.blockBuf` is `nil` (no pool buffer to return).
+- If the block came from disk, `it.blockBuf` points to the pool buffer backing `it.blockData`; it is returned to `blockPool` on the next `loadBlock` call or when the iterator is closed.
+
+On success, sets `it.blockIdx = idx` and `it.blockPos = 0`.
 
 ---
 
@@ -350,9 +373,10 @@ Marks the iterator as invalid. **Does not close the file** — that is the `Read
 
 | Aspect | Decision | Rationale |
 |---|---|---|
-| **No block cache** | Each `readBlock` allocates fresh memory | Simplicity. Production systems (RocksDB, LevelDB) cache hot blocks in an LRU to avoid repeated allocation and I/O. |
-| **Read amplification** | `Get` reads at most one data block | The bloom filter reduces the common case (absent key) to zero block reads. For present keys, exactly one block is read. |
+| **Block cache** | Shared LRU cache keyed by `(path, offset)`; capacity-bounded (default 8 MB) | Eliminates repeated disk I/O for hot blocks. Cache misses still read exactly one block from disk. |
+| **Read amplification** | `Get` reads at most one data block | The bloom filter reduces the common case (absent key) to zero block reads. For present keys, exactly one block is read (or returned from cache). |
 | **Index in memory** | Entire index loaded at `NewReader` | For typical SSTable sizes, the index is small (one 8–64 byte entry per 4 KB block). Holding it in memory eliminates index block reads during lookup. |
 | **Tombstones exposed** | `IsTombstone()` returns `true` for deletions | Compaction and merge iterators need to see tombstones so they can suppress older versions of the same key from lower SSTable levels. |
 | **Iterator does not own the file** | `Close()` on iterator sets `valid=false` only | Allows the store to create multiple iterators from one `Reader` (e.g., for merge compaction) without lifetime coupling between iterators and the file. |
 | **Linear scan within block** | No binary search within a data block | Blocks are small (≤ 4 KB + one record). Binary search within a block would require storing record offsets. The simplicity win outweighs the minor scan cost. |
+| **Copy-on-cache-store** | `PutBlock` receives a fresh copy of the block | Pool buffers are reused immediately after the scan; the cache entry must own its slice independently to remain valid after the buffer is returned to the pool. |

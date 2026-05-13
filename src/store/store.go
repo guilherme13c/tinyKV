@@ -32,6 +32,7 @@ type Store struct {
 	wal       w.LogWriterI
 	sstables  []*sst.Reader
 	manifest  *manifest
+	cache     *blockCache
 	walPath   string
 	dir       string
 	mu        sync.RWMutex
@@ -42,6 +43,8 @@ type Store struct {
 }
 
 func NewStore(walPath string, dir string) (*Store, error) {
+	cache := newBlockCache(DefaultBlockCacheCapacity)
+
 	// Open manifest and recover the list of live SSTables.
 	mf, livePaths, err := openManifest(dir)
 	if err != nil {
@@ -51,7 +54,7 @@ func NewStore(walPath string, dir string) (*Store, error) {
 	// Load SSTable readers newest-first (manifest records oldest-first).
 	readers := make([]*sst.Reader, 0, len(livePaths))
 	for i := len(livePaths) - 1; i >= 0; i-- {
-		r, err := sst.NewReader(livePaths[i])
+		r, err := sst.NewReader(livePaths[i], cache)
 		if err != nil {
 			_ = mf.close()
 			return nil, err
@@ -107,6 +110,7 @@ func NewStore(walPath string, dir string) (*Store, error) {
 		manifest: mf,
 		memtable: memtable,
 		sstables: readers,
+		cache:    cache,
 		dir:      dir,
 	}, nil
 }
@@ -319,7 +323,7 @@ func (s *Store) flushBackground(imm mt.MemTableI, immWALPath string) {
 		return
 	}
 
-	r, err := sst.NewReader(path)
+	r, err := sst.NewReader(path, s.cache)
 	if err != nil {
 		_ = os.Remove(path)
 		s.mu.Lock()
@@ -449,7 +453,7 @@ func (s *Store) compactIO(oldReaders []*sst.Reader) (*sst.Reader, error) {
 	}
 
 	// Open the new reader before closing the old ones.
-	newReader, err := sst.NewReader(outPath)
+	newReader, err := sst.NewReader(outPath, s.cache)
 	if err != nil {
 		_ = os.Remove(outPath)
 		return nil, err
@@ -459,6 +463,7 @@ func (s *Store) compactIO(oldReaders []*sst.Reader) (*sst.Reader, error) {
 		path := r.Path()
 		_ = r.Close()
 		_ = os.Remove(path)
+		s.cache.remove(path)
 	}
 
 	return newReader, nil
@@ -486,7 +491,7 @@ func (s *Store) flushSync() error {
 		return err
 	}
 
-	r, err := sst.NewReader(path)
+	r, err := sst.NewReader(path, s.cache)
 	if err != nil {
 		return err
 	}

@@ -147,7 +147,7 @@ func BenchmarkSSTGet(b *testing.B) {
 				b.Fatal(err)
 			}
 
-			sr, err := sstable.NewReader(path)
+			sr, err := sstable.NewReader(path, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -184,7 +184,7 @@ func BenchmarkSSTGetMiss(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	sr, err := sstable.NewReader(path)
+	sr, err := sstable.NewReader(path, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

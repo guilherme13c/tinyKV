@@ -11,6 +11,13 @@ import (
 	"github.com/guilherme13c/tinyKV/src/memtable"
 )
 
+// BlockCache is the interface satisfied by the store's block cache.
+// Pass nil to NewReader to disable block caching.
+type BlockCache interface {
+	GetBlock(path string, offset uint64) ([]byte, bool)
+	PutBlock(path string, offset uint64, data []byte)
+}
+
 type indexEntry struct {
 	lastKey []byte
 	handle  BlockHandle
@@ -21,6 +28,7 @@ type Reader struct {
 	index     []indexEntry
 	bloom     *BloomFilter
 	blockPool sync.Pool
+	cache     BlockCache // nil when caching is disabled
 }
 
 func (r *Reader) Path() string { return r.file.Name() }
@@ -35,7 +43,7 @@ func (r *Reader) EstimatedKeyCount() int {
 	return (len(r.bloom.bits)*8 + bitsPerKey - 1) / bitsPerKey
 }
 
-func NewReader(path string) (*Reader, error) {
+func NewReader(path string, cache BlockCache) (*Reader, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
@@ -96,10 +104,39 @@ func NewReader(path string) (*Reader, error) {
 		file:  f,
 		index: index,
 		bloom: bloom,
+		cache: cache,
 		blockPool: sync.Pool{
 			New: func() any { b := make([]byte, 4096); return &b },
 		},
 	}, nil
+}
+
+// readCachedBlock fetches the block described by handle from the cache when
+// available, falling back to a disk read on a miss. Returns:
+//   - data:    the block bytes
+//   - poolBuf: non-nil when the backing buffer came from blockPool; the caller
+//     must return it with r.blockPool.Put(poolBuf) after use. nil when the
+//     data was served from the cache (no pool buffer is involved).
+//   - err: non-nil on I/O failure
+func (r *Reader) readCachedBlock(handle BlockHandle) (data []byte, poolBuf *[]byte, err error) {
+	if r.cache != nil {
+		if cached, ok := r.cache.GetBlock(r.file.Name(), handle.Offset); ok {
+			return cached, nil, nil
+		}
+	}
+	bp := r.blockPool.Get().(*[]byte)
+	data, err = r.readBlockInto(handle, bp)
+	if err != nil {
+		r.blockPool.Put(bp)
+		return nil, nil, err
+	}
+	if r.cache != nil {
+		// Store a copy in the cache; the pool buffer will be reused by the caller.
+		cached := make([]byte, len(data))
+		copy(cached, data)
+		r.cache.PutBlock(r.file.Name(), handle.Offset, cached)
+	}
+	return data, bp, nil
 }
 
 func (r *Reader) Get(key []byte) ([]byte, error) {
@@ -123,14 +160,14 @@ func (r *Reader) Get(key []byte) ([]byte, error) {
 		return nil, &src.KeyNotFoundError{Key: key}
 	}
 
-	bp := r.blockPool.Get().(*[]byte)
-	data, err := r.readBlockInto(r.index[blockIdx].handle, bp)
+	data, bp, err := r.readCachedBlock(r.index[blockIdx].handle)
 	if err != nil {
-		r.blockPool.Put(bp)
 		return nil, err
 	}
 	result, scanErr := scanBlock(data, key)
-	r.blockPool.Put(bp)
+	if bp != nil {
+		r.blockPool.Put(bp)
+	}
 	return result, scanErr
 }
 
@@ -307,10 +344,8 @@ func (it *sstableIterator) loadBlock(idx int) bool {
 		it.blockBuf = nil
 		it.blockData = nil
 	}
-	bp := it.r.blockPool.Get().(*[]byte)
-	data, err := it.r.readBlockInto(it.r.index[idx].handle, bp)
+	data, bp, err := it.r.readCachedBlock(it.r.index[idx].handle)
 	if err != nil {
-		it.r.blockPool.Put(bp)
 		return false
 	}
 
@@ -326,7 +361,7 @@ func (it *sstableIterator) loadBlock(idx int) bool {
 
 	it.blockIdx = idx
 	it.blockData = data
-	it.blockBuf = bp
+	it.blockBuf = bp // nil when the block was served from cache
 	it.blockPos = 0
 	it.blockDataEnd = blockDataEnd
 	return true

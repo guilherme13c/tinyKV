@@ -156,34 +156,34 @@ All results: Intel Core i7-1165G7 @ 2.80GHz, linux/amd64, 8 logical cores, `-ben
 
 #### Writes
 
-| Operation        | tinyKV          | LevelDB     | RocksDB      | vs LevelDB | vs RocksDB |
-| ---------------- | --------------- | ----------- | ------------ | ---------- | ---------- |
-| `put` sequential | **6,503 ns/op** | 9,124 ns/op | 8,879 ns/op  | **+40%**   | **+37%**   |
-| `put` random     | 14,795 ns/op    | 7,282 ns/op | 12,400 ns/op | −51%       | −16%       |
-| `delete`         | 3,190 ns/op     | 3,141 ns/op | 8,703 ns/op  | −2%        | **+173%**  |
-| concurrent `put` | **5,761 ns/op** | 6,264 ns/op | 12,029 ns/op | **+9%**    | **+109%**  |
+| Operation        | tinyKV          | LevelDB     | RocksDB     | vs LevelDB | vs RocksDB |
+| ---------------- | --------------- | ----------- | ----------- | ---------- | ---------- |
+| `put` sequential | 4,567 ns/op     | 3,284 ns/op | 5,398 ns/op | −28%       | **+18%**   |
+| `put` random     | 5,234 ns/op     | 4,235 ns/op | 8,461 ns/op | −19%       | **+62%**   |
+| `delete`         | **2,806 ns/op** | 3,184 ns/op | 7,188 ns/op | **+13%**   | **+156%**  |
+| concurrent `put` | 5,408 ns/op     | 5,378 ns/op | 9,236 ns/op | ~0%        | **+71%**   |
 
-tinyKV wins sequential puts, concurrent puts, and deletes against RocksDB by a wide margin. Against LevelDB, sequential puts (+40%) and concurrent puts (+9%) favour tinyKV; random puts are slower because the SkipList's pointer-chasing access pattern causes more cache misses than LevelDB's sorted-block layout at a 10 M-key keyspace.
+tinyKV beats RocksDB on every write operation. Against LevelDB, sequential and random puts are slower — LevelDB's sorted-block format and write-batch coalescing give it an edge in write-heavy microbenchmarks, while the SkipList's pointer-chasing causes more cache misses at a 10 M-key keyspace. Deletes favour tinyKV (+13% over LevelDB) and concurrent puts are essentially tied.
 
 #### Reads
 
-| Operation            | tinyKV          | LevelDB     | RocksDB     | vs LevelDB | vs RocksDB |
-| -------------------- | --------------- | ----------- | ----------- | ---------- | ---------- |
-| `get` hot (memtable) | **393 ns/op**   | 1,055 ns/op | 2,449 ns/op | **+168%**  | **+523%**  |
-| `get` cold (SSTable) | **1,214 ns/op** | 2,021 ns/op | 9,488 ns/op | **+66%**   | **+681%**  |
-| `get` miss (bloom)   | **200.8 ns/op** | 431.1 ns/op | 853.5 ns/op | **+115%**  | **+325%**  |
+| Operation            | tinyKV        | LevelDB       | RocksDB       | vs LevelDB | vs RocksDB   |
+| -------------------- | ------------- | ------------- | ------------- | ---------- | ------------ |
+| `get` hot (memtable) | **242 ns/op** | 762 ns/op     | 1,903 ns/op   | **+215%**  | **+686%**    |
+| `get` cold (SSTable) | **432 ns/op** | 1,492 ns/op   | 6,369 ns/op   | **+245%**  | **+1,374%**  |
+| `get` miss (bloom)   | **164 ns/op** | 331 ns/op     | 606 ns/op     | **+102%**  | **+269%**    |
 
-tinyKV dominates reads across all three scenarios. Hot reads are **2.7× faster than LevelDB** and **6.2× faster than RocksDB** — the CGO boundary adds hundreds of nanoseconds on every call; tinyKV is a direct Go function call. Cold reads are **66% faster than LevelDB** and **7.8× faster than RocksDB**. Bloom-filter misses are **2.1× faster than LevelDB** thanks to xxHash64's throughput advantage.
+tinyKV dominates reads across all three scenarios. Hot reads are **3.1× faster than LevelDB** and **7.9× faster than RocksDB** — the CGO boundary adds hundreds of nanoseconds on every call; tinyKV is a direct Go function call. Cold reads are **3.5× faster than LevelDB** and **14.7× faster than RocksDB** thanks to the LRU block cache eliminating repeat disk I/O for hot SSTable blocks. Bloom-filter misses are **2× faster than LevelDB** thanks to xxHash64's throughput advantage.
 
 #### Scans
 
-| Range size  | tinyKV        | LevelDB   | RocksDB    | vs LevelDB | vs RocksDB |
-| ----------- | ------------- | --------- | ---------- | ---------- | ---------- |
-| 100 keys    | **15,632 ns** | 55,526 ns | 116,650 ns | **+255%**  | **+646%**  |
-| 1,000 keys  | **127 µs**    | 503 µs    | 1,220 µs   | **+296%**  | **+861%**  |
-| 10,000 keys | **1,138 µs**  | 5,249 µs  | 11,485 µs  | **+361%**  | **+909%**  |
+| Range size  | tinyKV          | LevelDB       | RocksDB       | vs LevelDB | vs RocksDB   |
+| ----------- | --------------- | ------------- | ------------- | ---------- | ------------ |
+| 100 keys    | **9,928 ns**    | 46,526 ns     | 79,379 ns     | **+369%**  | **+700%**    |
+| 1,000 keys  | **80,589 ns**   | 441,305 ns    | 984,778 ns    | **+447%**  | **+1,121%**  |
+| 10,000 keys | **842,013 ns**  | 4,286,052 ns  | 9,230,844 ns  | **+409%**  | **+996%**    |
 
-Scan allocs/op: tinyKV **13** (constant); LevelDB/RocksDB **202 / 201 per 100 keys** (one allocation per returned entry via CGO). tinyKV's merge iterator pre-allocates the heap once and reuses it for the entire range.
+Scan allocs/op: tinyKV **10** (constant); LevelDB/RocksDB **202 / 201 per 100 keys** (one allocation per returned entry via CGO). tinyKV's merge iterator pre-allocates the heap once and reuses it for the entire range.
 
 ---
 
@@ -193,9 +193,9 @@ Scan allocs/op: tinyKV **13** (constant); LevelDB/RocksDB **202 / 201 per 100 ke
 
 | Value size | ns/op   | Throughput | Allocs/op |
 | ---------- | ------- | ---------- | --------- |
-| 64 B       | 6,146   | 13 MB/s    | 1         |
-| 1 KB       | 20,451  | 51 MB/s    | 2         |
-| 16 KB      | 100,776 | 163 MB/s   | 4         |
+| 64 B       | 3,934   | 20 MB/s    | 1         |
+| 1 KB       | 18,976  | 55 MB/s    | 4         |
+| 16 KB      | 129,700 | 126 MB/s   | 9         |
 
 Write cost grows sub-linearly with value size — the WAL write-stealing leader batches concurrent payloads into a single `file.Write()`, amortising syscall overhead across goroutines.
 
@@ -205,12 +205,12 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 | Scenario             | key=16 B | key=64 B | key=256 B | Allocs/op |
 | -------------------- | -------- | -------- | --------- | --------- |
-| **Hot** (memtable)   | 347 ns   | 332 ns   | 485 ns    | 0         |
-| **Cold** (SSTable)   | 1,286 ns | 1,593 ns | 997 ns    | 1–2       |
-| **Miss** (not found) | 143 ns   | 141 ns   | 160 ns    | 2         |
+| **Hot** (memtable)   | 243 ns   | 258 ns   | 366 ns    | 0         |
+| **Cold** (SSTable)   | 370 ns   | 503 ns   | 564 ns    | 1         |
+| **Miss** (not found) | 136 ns   | 149 ns   | 167 ns    | 2         |
 
 **Hot reads** hit the SkipList under a shared read-lock — no allocation, no I/O.  
-**Cold reads** add one SSTable binary-search + bloom-filter probe (~700–1,200 ns extra).  
+**Cold reads** hit the LRU block cache on warm accesses, closing the gap with hot-read latency (~370–564 ns vs 243–366 ns hot).  
 **Misses** short-circuit at the bloom filter before any disk access.
 
 ---
@@ -219,9 +219,9 @@ Write cost grows sub-linearly with value size — the WAL write-stealing leader 
 
 | Range size  | ns/op   | Throughput | Allocs/op |
 | ----------- | ------- | ---------- | --------- |
-| 100 keys    | 10,173  | 786 MB/s   | 12        |
-| 1,000 keys  | 87,821  | 911 MB/s   | 12        |
-| 10,000 keys | 848,623 | 943 MB/s   | 12        |
+| 100 keys    | 8,360   | 957 MB/s   | 9         |
+| 1,000 keys  | 74,215  | 1,078 MB/s | 9         |
+| 10,000 keys | 785,818 | 1,018 MB/s | 9         |
 
 Alloc count stays constant regardless of range size — the merge iterator heap is allocated once per `Scan` call.
 
@@ -235,7 +235,7 @@ Alloc count stays constant regardless of range size — the merge iterator heap 
 | `get` (hot)  | 0         | Returns slice into arena; zero allocation |
 | `get` (cold) | 1–2       | One slice for the decoded value           |
 | `delete`     | 1         | Tombstone key copy only                   |
-| `scan`       | 12        | Iterator + merge heap allocation          |
+| `scan`       | 9         | Iterator + merge heap allocation          |
 
 The arena pool (`chan []skipListNode`, capacity 4) eliminates per-node allocations in the SkipList and survives GC cycles — unlike `sync.Pool`, which is cleared at every GC, it is not emptied during flush-cycle pauses.
 

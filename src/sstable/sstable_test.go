@@ -36,7 +36,7 @@ func buildSST(t *testing.T, dir string, entries []sstEntry) *sstable.Reader {
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close writer: %v", err)
 	}
-	r, err := sstable.NewReader(path)
+	r, err := sstable.NewReader(path, nil)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestSSTMultipleBlocks(t *testing.T) {
 		t.Fatalf("Close writer: %v", err)
 	}
 
-	r, err := sstable.NewReader(path)
+	r, err := sstable.NewReader(path, nil)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestSSTPath(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := sstable.NewReader(path)
+	r, err := sstable.NewReader(path, nil)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestSSTVersionMismatch(t *testing.T) {
 	}
 	f.Close()
 
-	_, err = sstable.NewReader(path)
+	_, err = sstable.NewReader(path, nil)
 	if err == nil {
 		t.Fatal("expected error for version mismatch, got nil")
 	}
@@ -359,7 +359,7 @@ func TestSSTEmptySSTable(t *testing.T) {
 		t.Fatalf("Close empty writer: %v", err)
 	}
 
-	r, err := sstable.NewReader(path)
+	r, err := sstable.NewReader(path, nil)
 	if err != nil {
 		t.Fatalf("NewReader on empty SSTable: %v", err)
 	}

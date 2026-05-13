@@ -113,6 +113,7 @@ type Store struct {
     wal       w.LogWriterI
     sstables  []*sst.Reader
     manifest  *manifest
+    cache     *blockCache
     walPath   string
     dir       string
     mu        sync.RWMutex
@@ -131,6 +132,7 @@ type Store struct {
 | `wal` | `w.LogWriterI` | Write-ahead log writer for the active memtable. |
 | `sstables` | `[]*sst.Reader` | Ordered list of SSTable readers, **newest first** (`[0]` is the most recently flushed). |
 | `manifest` | `*manifest` | Tracks which SSTable files are live on disk. |
+| `cache` | `*blockCache` | Shared LRU block cache (default 8 MB). Passed to every `sst.NewReader` call. Entries for deleted SSTables are invalidated during compaction via `cache.remove(path)`. |
 | `walPath` | `string` | Absolute path of the active WAL file. The immutable WAL lives at `walPath + ".immutable"`. |
 | `dir` | `string` | Directory that holds SSTable files and the MANIFEST. |
 | `mu` | `sync.RWMutex` | Guards the SSTable list, the `immutable` pointer, `bgErr`, and `flushWg`. Held shared (`RLock`) during normal reads and writes; held exclusively (`Lock`) only for freeze and compaction. Always acquired before `memMu`. |
@@ -149,13 +151,15 @@ func NewStore(walPath string, dir string) (*Store, error)
 Full startup sequence:
 
 ```
+newBlockCache(DefaultBlockCacheCapacity)   // create 8 MB LRU block cache
+
 openManifest(dir)
     └─ replayManifest → live SSTable paths (oldest → newest)
     └─ open MANIFEST for appending
 
 Load SSTable readers (reverse manifest order → newest first)
     for i := len(livePaths)-1; i >= 0; i-- {
-        readers = append(readers, sst.NewReader(livePaths[i]))
+        readers = append(readers, sst.NewReader(livePaths[i], cache))
     }
 
 Crash recovery: check for walPath+".immutable"
@@ -167,7 +171,7 @@ Replay active WAL into the same SkipList
 
 Open WAL writer (truncates nothing; O_APPEND)
 
-Return &Store{...}
+Return &Store{..., cache: cache}
 ```
 
 **Crash-recovery detail.** If the process died during `flushBackground`, the
