@@ -13,14 +13,30 @@ record of exactly which files constitute valid state. The manifest provides that
 
 ```go
 type manifestRecord struct {
-    Op   string `json:"op"`   // "add" or "del"
-    Path string `json:"path"`
+    Op    string `json:"op"`              // "add" or "del"
+    Path  string `json:"path"`
+    Level int    `json:"level,omitempty"` // SSTable level (0=L0, 1=L1, 2=L2); absent in old files → treated as 0
 }
 ```
 
 One record per line in the MANIFEST file. `Op` is either `"add"` (a new SSTable
 was successfully flushed) or `"del"` (an SSTable was superseded by compaction).
-`Path` is the absolute filesystem path of the SSTable file.
+`Path` is the absolute filesystem path of the SSTable file. `Level` records which
+compaction level the file belongs to; the field is omitted for level-0 files
+written by older versions of the store (backward-compatible default: 0).
+
+### `sstMeta`
+
+```go
+type sstMeta struct {
+    Path  string
+    Level int
+}
+```
+
+Returned by `replayManifest` as the richer per-file descriptor that carries both
+the path and the compaction level. `NewStore` uses the level to place each
+`sst.Reader` into the correct slot of `levels[numLevels]`.
 
 ### `manifest`
 
@@ -44,22 +60,26 @@ One JSON object per line (newline-delimited JSON):
 {"op":"add","path":"/data/store/1700000000000000000.sst"}
 {"op":"add","path":"/data/store/1700000001000000000.sst"}
 {"op":"del","path":"/data/store/1700000000000000000.sst"}
-{"op":"add","path":"/data/store/1700000002000000000.sst"}
+{"op":"add","path":"/data/store/1700000002000000000.sst","level":1}
+{"op":"del","path":"/data/store/1700000001000000000.sst"}
 ```
 
 After replaying this sequence:
-- `1700000000000000000.sst` → **dead** (added then deleted)
-- `1700000001000000000.sst` → **live**
-- `1700000002000000000.sst` → **live**
+- `1700000000000000000.sst` → **dead** (added as L0, then deleted)
+- `1700000001000000000.sst` → **dead** (added as L0, then compacted away)
+- `1700000002000000000.sst` → **live**, L1
 
-Live files are returned in the order they first appeared (`oldest → newest`).
+Live files are returned in the order they first appeared (`oldest → newest`)
+together with their level. Records without a `"level"` field default to level 0
+for backward compatibility with manifests written before leveled compaction was
+introduced.
 
 ---
 
 ## `openManifest`
 
 ```go
-func openManifest(dir string) (*manifest, []string, error)
+func openManifest(dir string) (*manifest, []sstMeta, error)
 ```
 
 ```
@@ -73,21 +93,21 @@ return &manifest{file: f}, live, nil
 ```
 
 Returns both the `manifest` struct (for appending future records) and the slice
-of live SSTable paths (for loading readers on startup).
+of live `sstMeta` values (path + level) for loading readers on startup.
 
 ---
 
 ## `replayManifest`
 
 ```go
-func replayManifest(path string) ([]string, error)
+func replayManifest(path string) ([]sstMeta, error)
 ```
 
 Single forward scan over the MANIFEST file. Builds two data structures:
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `ordered` | `[]string` | All paths seen, in first-appearance order |
+| `ordered` | `[]sstMeta` | All files seen, in first-appearance order, with their level |
 | `alive` | `map[string]bool` | Current liveness of each path |
 
 **Scan rules:**
@@ -99,14 +119,19 @@ for each line:
     switch rec.Op:
         "add":
             if !alive[rec.Path]:
-                ordered = append(ordered, rec.Path)
+                ordered = append(ordered, sstMeta{rec.Path, rec.Level})
                 alive[rec.Path] = true
         "del":
             alive[rec.Path] = false
 
-live = [p for p in ordered if alive[p]]
+live = [m for m in ordered if alive[m.Path]]
 return live, scanner.Err()
 ```
+
+**Backward compatibility.** Records without a `"level"` field unmarshal with
+`Level=0`, placing old files into L0. This is the safest default because L0
+makes no ordering guarantees; old files will be compacted into L1 on the next
+flush cycle.
 
 **Idempotency.** The `!alive[rec.Path]` guard means a path that appears twice in
 `"add"` records is only inserted into `ordered` once. This is important for the
@@ -115,18 +140,22 @@ SSTable flush is marked complete — on the next startup, the path may be re-add
 without creating a duplicate entry.
 
 **Result ordering.** `live` preserves the original insertion order of the
-MANIFEST, meaning the returned slice is **oldest → newest**. `NewStore` reverses
-this order when loading readers so that `sstables[0]` is the most recently flushed
-file (newest-first, matching lookup semantics).
+MANIFEST, meaning the returned slice is **oldest → newest**. `NewStore` iterates
+this slice in reverse when loading readers so that `levels[l][0]` is the most
+recently flushed file within each level.
 
 ---
 
 ## `recordAdd` / `recordDel`
 
 ```go
-func (m *manifest) recordAdd(path string) error
+func (m *manifest) recordAdd(path string, level int) error
 func (m *manifest) recordDel(path string) error
 ```
+
+`recordAdd` now accepts a `level` parameter that is embedded in the JSON record.
+`recordDel` records a deletion at whatever level the file was originally at (the
+level is not needed for deletion — `Path` is the unique key).
 
 Both delegate to `append`:
 

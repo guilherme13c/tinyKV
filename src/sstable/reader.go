@@ -29,9 +29,30 @@ type Reader struct {
 	bloom     *BloomFilter
 	blockPool sync.Pool
 	cache     BlockCache // nil when caching is disabled
+	minKey    []byte     // first key in the SSTable; nil for an empty file
 }
 
 func (r *Reader) Path() string { return r.file.Name() }
+
+// MinKey returns the first (smallest) key in the SSTable.
+func (r *Reader) MinKey() []byte { return r.minKey }
+
+// MaxKey returns the last (largest) key in the SSTable.
+func (r *Reader) MaxKey() []byte {
+	if len(r.index) == 0 {
+		return nil
+	}
+	return r.index[len(r.index)-1].lastKey
+}
+
+// FileSize returns the size of the SSTable file in bytes.
+func (r *Reader) FileSize() (int64, error) {
+	info, err := r.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
 
 // EstimatedKeyCount returns an approximation of the number of keys in the SSTable,
 // derived from the bloom filter bit-array size: n ≈ ⌈bloomBytes × 8 / bitsPerKey⌉.
@@ -100,15 +121,50 @@ func NewReader(path string, cache BlockCache) (*Reader, error) {
 		return nil, err
 	}
 
+	// Read the first key (minKey) from the first block.
+	var minKey []byte
+	if len(index) > 0 {
+		minKey, err = readFirstKey(f, index[0].handle)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+
 	return &Reader{
-		file:  f,
-		index: index,
-		bloom: bloom,
-		cache: cache,
+		file:   f,
+		index:  index,
+		bloom:  bloom,
+		cache:  cache,
+		minKey: minKey,
 		blockPool: sync.Pool{
 			New: func() any { b := make([]byte, 4096); return &b },
 		},
 	}, nil
+}
+
+// readFirstKey reads and returns the first key stored in the block described by handle.
+func readFirstKey(f *os.File, handle BlockHandle) ([]byte, error) {
+	buf := make([]byte, handle.Length)
+	if _, err := f.ReadAt(buf, int64(handle.Offset)); err != nil {
+		return nil, err
+	}
+	// Decode: keyLen (uvarint), valueMeta (uvarint), key bytes.
+	keyLen, n := binary.Uvarint(buf)
+	if n <= 0 {
+		return nil, fmt.Errorf("sstable: malformed first block")
+	}
+	_, n2 := binary.Uvarint(buf[n:])
+	if n2 <= 0 {
+		return nil, fmt.Errorf("sstable: malformed first block")
+	}
+	keyStart := n + n2
+	if keyStart+int(keyLen) > len(buf) {
+		return nil, fmt.Errorf("sstable: first block truncated")
+	}
+	key := make([]byte, keyLen)
+	copy(key, buf[keyStart:keyStart+int(keyLen)])
+	return key, nil
 }
 
 // readCachedBlock fetches the block described by handle from the cache when

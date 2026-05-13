@@ -10,15 +10,22 @@ import (
 const manifestFilename = "MANIFEST"
 
 type manifestRecord struct {
-	Op   string `json:"op"`   // "add" or "del"
-	Path string `json:"path"` // SSTable file path
+	Op    string `json:"op"`              // "add" or "del"
+	Path  string `json:"path"`            // SSTable file path
+	Level int    `json:"level,omitempty"` // SSTable level (0 = L0)
+}
+
+// sstMeta pairs an SSTable path with its level.
+type sstMeta struct {
+	Path  string
+	Level int
 }
 
 type manifest struct {
 	file *os.File
 }
 
-func openManifest(dir string) (*manifest, []string, error) {
+func openManifest(dir string) (*manifest, []sstMeta, error) {
 	path := filepath.Join(dir, manifestFilename)
 
 	// Replay existing manifest to find the live SSTable list.
@@ -35,7 +42,7 @@ func openManifest(dir string) (*manifest, []string, error) {
 	return &manifest{file: f}, live, nil
 }
 
-func replayManifest(path string) ([]string, error) {
+func replayManifest(path string) ([]sstMeta, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return nil, nil // fresh store, no manifest yet
@@ -46,7 +53,7 @@ func replayManifest(path string) ([]string, error) {
 	defer f.Close()
 
 	// Use a slice to preserve insertion order (newest-first is enforced at load time).
-	var ordered []string
+	var ordered []sstMeta
 	alive := make(map[string]bool)
 
 	scanner := bufio.NewScanner(f)
@@ -58,7 +65,7 @@ func replayManifest(path string) ([]string, error) {
 		switch rec.Op {
 		case "add":
 			if !alive[rec.Path] {
-				ordered = append(ordered, rec.Path)
+				ordered = append(ordered, sstMeta{Path: rec.Path, Level: rec.Level})
 				alive[rec.Path] = true
 			}
 		case "del":
@@ -67,18 +74,17 @@ func replayManifest(path string) ([]string, error) {
 	}
 
 	// Return only live entries in their original order (oldest→newest).
-	// The store will reverse this to newest-first when loading readers.
-	var live []string
-	for _, p := range ordered {
-		if alive[p] {
-			live = append(live, p)
+	var live []sstMeta
+	for _, m := range ordered {
+		if alive[m.Path] {
+			live = append(live, m)
 		}
 	}
 	return live, scanner.Err()
 }
 
-func (m *manifest) recordAdd(path string) error {
-	return m.append(manifestRecord{Op: "add", Path: path})
+func (m *manifest) recordAdd(path string, level int) error {
+	return m.append(manifestRecord{Op: "add", Path: path, Level: level})
 }
 
 func (m *manifest) recordDel(path string) error {

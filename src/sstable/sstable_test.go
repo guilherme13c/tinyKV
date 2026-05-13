@@ -347,6 +347,46 @@ func TestSSTVersionMismatch(t *testing.T) {
 	}
 }
 
+func TestSSTMinMaxKey(t *testing.T) {
+	entries := []sstEntry{
+		{"key-001", "v1", false},
+		{"key-002", "v2", false},
+		{"key-050", "v3", false},
+		{"key-999", "v4", false},
+	}
+	r := buildSST(t, t.TempDir(), entries)
+
+	if string(r.MinKey()) != "key-001" {
+		t.Errorf("MinKey: got %q, want %q", r.MinKey(), "key-001")
+	}
+	if string(r.MaxKey()) != "key-999" {
+		t.Errorf("MaxKey: got %q, want %q", r.MaxKey(), "key-999")
+	}
+}
+
+func TestSSTMinMaxKeyEmpty(t *testing.T) {
+	r := buildSST(t, t.TempDir(), nil)
+
+	if r.MinKey() != nil {
+		t.Errorf("MinKey on empty SSTable: got %q, want nil", r.MinKey())
+	}
+	if r.MaxKey() != nil {
+		t.Errorf("MaxKey on empty SSTable: got %q, want nil", r.MaxKey())
+	}
+}
+
+func TestSSTFileSize(t *testing.T) {
+	r := buildSST(t, t.TempDir(), []sstEntry{{"k", "v", false}})
+
+	sz, err := r.FileSize()
+	if err != nil {
+		t.Fatalf("FileSize: %v", err)
+	}
+	if sz <= 0 {
+		t.Errorf("FileSize: got %d, want > 0", sz)
+	}
+}
+
 func TestSSTEmptySSTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty.sst")

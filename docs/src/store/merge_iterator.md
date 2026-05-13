@@ -6,7 +6,8 @@
 | Caller | `startKey` | `endKey` | `includeTombstones` |
 |--------|-----------|---------|---------------------|
 | `Store.Scan` | user-supplied | user-supplied | `false` |
-| `Store.compact` | `nil` | `nil` | `true` |
+| `compactL0` | `nil` | `nil` | `true` |
+| `compactL1ToL2` | `nil` | `nil` | `true` |
 
 The iterator enforces **newest-wins** semantics: when the same key appears in
 multiple sources, the entry from the source with the lowest index (most recently

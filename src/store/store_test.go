@@ -431,9 +431,202 @@ func TestStoreCloseWaitsFlush(t *testing.T) {
 	}
 }
 
-// TestStoreConcurrentWrites exercises the dual-lock write path (mu.RLock +
-// memMu.Lock) with many goroutines writing simultaneously. The race detector
-// will catch any data race introduced by incorrect lock usage.
+// TestStoreLeveledTombstoneAcrossLevels verifies that a delete applied after a
+// key has been compacted into L1 correctly hides the key on subsequent reads.
+// The test writes 4 batches of 1100 large entries to force L0→L1 compaction,
+// then deletes a key that landed in L1 and confirms it is not found.
+func TestStoreLeveledTombstoneAcrossLevels(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal")
+	largeVal := bytes.Repeat([]byte("x"), 4096)
+	const batchSize = 1100
+
+	// Batch 0: write the target key plus enough filler to fill the memtable.
+	s, err := store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(0): %v", err)
+	}
+	if err := s.Put([]byte("lvl-target"), []byte("original")); err != nil {
+		t.Fatalf("Put target: %v", err)
+	}
+	for i := 0; i < batchSize; i++ {
+		if err := s.Put([]byte(fmt.Sprintf("lvl-b0-%04d", i)), largeVal); err != nil {
+			t.Fatalf("Put filler: %v", err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close(0): %v", err)
+	}
+
+	// Batches 1–3: accumulate 3 more L0 files so that the 4th flush triggers
+	// L0 → L1 compaction (compactionThreshold = 4).
+	for batch := 1; batch < 4; batch++ {
+		s, err = store.NewStore(walPath, dir)
+		if err != nil {
+			t.Fatalf("NewStore(%d): %v", batch, err)
+		}
+		for i := 0; i < batchSize; i++ {
+			if err := s.Put([]byte(fmt.Sprintf("lvl-b%d-%04d", batch, i)), largeVal); err != nil {
+				t.Fatalf("Put[batch=%d,i=%d]: %v", batch, i, err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close(%d): %v", batch, err)
+		}
+	}
+
+	// At this point "lvl-target" is in L1. Open a fresh store and delete it.
+	s, err = store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(delete): %v", err)
+	}
+	if err := s.Delete([]byte("lvl-target")); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close(delete): %v", err)
+	}
+
+	// Reopen: tombstone is in L0 (flushed by Close), original value in L1.
+	s, err = store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(verify): %v", err)
+	}
+	defer s.Close()
+
+	_, err = s.Get([]byte("lvl-target"))
+	if err == nil {
+		t.Fatal("expected key-not-found for tombstoned key, got nil")
+	}
+	if !errors.Is(err, src.ErrKeyNotFound) {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
+	}
+}
+
+// TestStoreLeveledScanAcrossLevels writes keys into two distinct batches that
+// end up in different levels after compaction, then verifies that a range scan
+// returns all expected keys in sorted order.
+func TestStoreLeveledScanAcrossLevels(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal")
+	largeVal := bytes.Repeat([]byte("x"), 4096)
+	const batchSize = 1100
+
+	// Batch 0: include anchor keys "zz-first" and "zz-last" so they persist
+	// through compaction.
+	s, err := store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(0): %v", err)
+	}
+	s.Put([]byte("zz-first"), []byte("1"))
+	for i := 0; i < batchSize; i++ {
+		s.Put([]byte(fmt.Sprintf("lvls-b0-%04d", i)), largeVal)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close(0): %v", err)
+	}
+
+	// Batches 1–2: filler.
+	for batch := 1; batch <= 2; batch++ {
+		s, err = store.NewStore(walPath, dir)
+		if err != nil {
+			t.Fatalf("NewStore(%d): %v", batch, err)
+		}
+		for i := 0; i < batchSize; i++ {
+			s.Put([]byte(fmt.Sprintf("lvls-b%d-%04d", batch, i)), largeVal)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close(%d): %v", batch, err)
+		}
+	}
+
+	// Batch 3: adds "zz-last" and triggers L0→L1 compaction.
+	s, err = store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(3): %v", err)
+	}
+	s.Put([]byte("zz-last"), []byte("2"))
+	for i := 0; i < batchSize; i++ {
+		s.Put([]byte(fmt.Sprintf("lvls-b3-%04d", i)), largeVal)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close(3): %v", err)
+	}
+
+	// Reopen and scan only the "zz-*" keys.
+	s, err = store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(scan): %v", err)
+	}
+	defer s.Close()
+
+	it, err := s.Scan([]byte("zz-"), []byte("zz~")) // "zz~" > all "zz-*" keys
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	defer it.Close()
+
+	var got []string
+	for ; it.Valid(); it.Next() {
+		got = append(got, string(it.Key()))
+	}
+	want := []string{"zz-first", "zz-last"}
+	if len(got) != len(want) {
+		t.Fatalf("Scan: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Scan[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestStoreLeveledManifestPersistence verifies that the store survives a
+// reopen after data has been spread across multiple levels: the manifest
+// correctly records per-file levels, and NewStore reloads them correctly.
+func TestStoreLeveledManifestPersistence(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal")
+	largeVal := bytes.Repeat([]byte("x"), 4096)
+	const batchSize = 1100
+	// 8 batches to trigger at least one L0→L1 and potentially L1→L2.
+	const numBatches = 8
+
+	for batch := 0; batch < numBatches; batch++ {
+		s, err := store.NewStore(walPath, dir)
+		if err != nil {
+			t.Fatalf("NewStore(batch %d): %v", batch, err)
+		}
+		for i := 0; i < batchSize; i++ {
+			if err := s.Put([]byte(fmt.Sprintf("mlvl-b%d-%04d", batch, i)), largeVal); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close(batch %d): %v", batch, err)
+		}
+	}
+
+	// Reopen and verify every written key is still readable.
+	s, err := store.NewStore(walPath, dir)
+	if err != nil {
+		t.Fatalf("NewStore(verify): %v", err)
+	}
+	defer s.Close()
+
+	for batch := 0; batch < numBatches; batch++ {
+		for i := 0; i < batchSize; i++ {
+			key := fmt.Sprintf("mlvl-b%d-%04d", batch, i)
+			val, err := s.Get([]byte(key))
+			if err != nil {
+				t.Fatalf("Get(%q): %v", key, err)
+			}
+			if !bytes.Equal(val, largeVal) {
+				t.Fatalf("Get(%q): value mismatch", key)
+			}
+		}
+	}
+}
 func TestStoreConcurrentWrites(t *testing.T) {
 	s := newTestStore(t)
 

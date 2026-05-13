@@ -87,6 +87,9 @@ func (w *Writer) returnBloomBufs() {
 	w.bloomBuf = nil
 }
 
+// BytesWritten returns the number of bytes written to the SSTable so far.
+func (w *Writer) BytesWritten() uint64 { return w.offset }
+
 func (w *Writer) Append(key, value []byte, isTombstone bool) error {
 	valueMeta := uint64(len(value)) << 1
 	if isTombstone {

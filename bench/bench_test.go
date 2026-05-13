@@ -201,7 +201,55 @@ func BenchmarkGetCold(b *testing.B) {
 	}
 }
 
-// BenchmarkGetMiss measures Get latency for keys that do not exist (bloom
+// BenchmarkGetColdLeveled measures Get throughput when data has been compacted
+// into L1 (non-overlapping sorted files). It contrast with BenchmarkGetCold
+// which reads from a single L0 SSTable: the leveled path uses binary search
+// within the level instead of probing every file.
+func BenchmarkGetColdLeveled(b *testing.B) {
+	for _, ks := range keySizes {
+		for _, vs := range valSizes {
+			b.Run(fmt.Sprintf("key=%dB/val=%dB", ks, vs), func(b *testing.B) {
+				const batchesNeeded = 4 // triggers L0→L1 compaction
+				dir := b.TempDir()
+
+				// Write 4 batches, each large enough to flush a full memtable,
+				// then close between batches so each produces its own SSTable.
+				var keys [][]byte
+				for batch := range batchesNeeded {
+					s := openStore(b, dir)
+					val := makeVal(vs)
+					for i := range seedCount {
+						k := makeKey(batch*seedCount+i, ks)
+						if batch == 0 {
+							keys = append(keys, k)
+						}
+						if err := s.Put(k, val); err != nil {
+							b.Fatal(err)
+						}
+					}
+					s = flushToDisk(b, s, dir)
+					_ = s.Close()
+				}
+
+				// Reopen: L0→L1 compaction has fired; data is in L1.
+				s := openStore(b, dir)
+				defer s.Close()
+
+				b.SetBytes(int64(ks + vs))
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				for i := range b.N {
+					if _, err := s.Get(keys[i%len(keys)]); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+
 // filter is the first line of defence on cold storage).
 func BenchmarkGetMiss(b *testing.B) {
 	for _, ks := range keySizes {
