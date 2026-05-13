@@ -6,20 +6,20 @@ The `memtable` package implements the **in-memory write buffer** of the tinyKV L
 
 ## Role in the LSM-tree
 
-In a Log-Structured Merge-tree, all writes are directed to an in-memory buffer — the *memtable* — before being flushed to disk as an SSTable. This design gives tinyKV three properties:
+In a Log-Structured Merge-tree, all writes are directed to an in-memory buffer — the _memtable_ — before being flushed to disk as an SSTable. This design gives tinyKV three properties:
 
 1. **Low write latency**: random writes become sequential I/O at flush time.
 2. **Fast recent reads**: the most recent version of any key is always checked in the memtable first.
-3. **Correct delete semantics**: deletes cannot erase data already flushed to SSTables, so they are recorded as *tombstones* (see [Tombstones](#tombstones-and-lsm-delete-semantics) below).
+3. **Correct delete semantics**: deletes cannot erase data already flushed to SSTables, so they are recorded as _tombstones_ (see [Tombstones](#tombstones-and-lsm-delete-semantics) below).
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         tinyKV Store                             │
-│                                                                  │
-│  Write ──► WAL ──► MemTable ──(flush)──► SSTable-N              │
-│                                                                  │
-│  Read  ──► MemTable ──► SSTable-N ──► SSTable-N-1 ──► …        │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                         tinyKV Store                       │
+│                                                            │
+│  Write ──► WAL ──► MemTable ──(flush)──► SSTable-N         │
+│                                                            │
+│  Read  ──► MemTable ──► SSTable-N ──► SSTable-N-1 ──► …    │
+└────────────────────────────────────────────────────────────┘
 ```
 
 The memtable holds all recent writes in memory, sorted by key. Once its byte size crosses a threshold (reported by `SizeInBytes()`), the store freezes the current memtable, flushes it to a new SSTable on disk, and starts a fresh memtable.
@@ -30,10 +30,10 @@ The memtable holds all recent writes in memory, sorted by key. Once its byte siz
 
 The package exposes two interfaces:
 
-| Interface | Purpose |
-|---|---|
-| `MemTableI` | Read/write access — Put, Get, Lookup, SizeInBytes, Iterator, Release |
-| `MemTableIteratorI` | Forward sorted scan over all entries, including tombstones |
+| Interface           | Purpose                                                              |
+| ------------------- | -------------------------------------------------------------------- |
+| `MemTableI`         | Read/write access — Put, Get, Lookup, SizeInBytes, Iterator, Release |
+| `MemTableIteratorI` | Forward sorted scan over all entries, including tombstones           |
 
 Separating the iterator from the table provides two concrete benefits:
 
@@ -57,12 +57,12 @@ Skip lists are a pragmatic fit for memtables:
 
 ### Alternative Data Structures
 
-| Structure | Point Lookup | Sorted Scan | Notes |
-|---|---|---|---|
-| **Skip List** *(current)* | O(log n) avg | O(n) | Simple code; probabilistic balance; no worst-case guarantee |
-| **Red-Black Tree** | O(log n) worst | O(n) | Deterministic worst-case; more complex rotation/rebalancing logic; no wasted pointer space |
-| **B-Tree / B+ Tree** | O(log n) | O(n) | Better CPU cache locality due to node arrays; higher per-node overhead; suited to larger in-memory sets |
-| **Hash Map** | O(1) avg | O(n log n) † | Fastest point lookups; †sorted scan requires a full sort at flush time; no ordering during the scan itself |
+| Structure                 | Point Lookup   | Sorted Scan  | Notes                                                                                                      |
+| ------------------------- | -------------- | ------------ | ---------------------------------------------------------------------------------------------------------- |
+| **Skip List** _(current)_ | O(log n) avg   | O(n)         | Simple code; probabilistic balance; no worst-case guarantee                                                |
+| **Red-Black Tree**        | O(log n) worst | O(n)         | Deterministic worst-case; more complex rotation/rebalancing logic; no wasted pointer space                 |
+| **B-Tree / B+ Tree**      | O(log n)       | O(n)         | Better CPU cache locality due to node arrays; higher per-node overhead; suited to larger in-memory sets    |
+| **Hash Map**              | O(1) avg       | O(n log n) † | Fastest point lookups; †sorted scan requires a full sort at flush time; no ordering during the scan itself |
 
 A hash map is the only poor fit for this role: the flush path needs to write keys to an SSTable in sorted order. An ordered structure (skip list, tree) provides that for free; a hash map requires a separate O(n log n) sort step at flush time.
 
@@ -78,11 +78,11 @@ arenaPool = make(chan []skipListNode, 4)   // pool of 4 pre-allocated slabs
 
 Each slab is a `[]skipListNode` of length 65536 (≈ 7.3 MB). On creation, two slots are reserved:
 
-| Index | Purpose |
-|---|---|
-| 0 | Tail sentinel node |
-| 1 | Head sentinel node |
-| 2+ | Bump-allocated node storage (`arenaTop` starts at 2) |
+| Index | Purpose                                              |
+| ----- | ---------------------------------------------------- |
+| 0     | Tail sentinel node                                   |
+| 1     | Head sentinel node                                   |
+| 2+    | Bump-allocated node storage (`arenaTop` starts at 2) |
 
 `newNode()` advances `arenaTop` to hand out the next slot. If the arena is exhausted (rare, large memtable), it falls back to a plain heap allocation so correctness is never compromised.
 
@@ -126,5 +126,5 @@ Storing tombstones in the memtable rather than performing physical deletes is fu
 
 ## Sub-documents
 
-- [`memtable.md`](memtable.md) — `MemTableI` and `MemTableIteratorI` interface reference
-- [`skip_list.md`](skip_list.md) — Deep-dive into the `SkipList` implementation
+- `memtable.md` — `MemTableI` and `MemTableIteratorI` interface reference *(not yet written)*
+- `skip_list.md` — Deep-dive into the `SkipList` implementation *(not yet written)*

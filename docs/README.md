@@ -52,10 +52,10 @@ tinyKV intentionally keeps each component minimal and independently readable:
                             │ StoreI
 ┌───────────────────────────▼─────────────────────────────┐
 │                      src/store/                         │
-│  ┌──────────────┐  ┌─────────────┐  ┌───────────────┐  │
-│  │  MemTable    │  │  Immutable  │  │  SSTable(s)   │  │
-│  │  (SkipList)  │  │  MemTable   │  │  [newest→old] │  │
-│  └──────┬───────┘  └──────┬──────┘  └───────┬───────┘  │
+│  ┌──────────────┐  ┌─────────────┐   ┌───────────────┐  │
+│  │  MemTable    │  │  Immutable  │   │  SSTable(s)   │  │
+│  │  (SkipList)  │  │  MemTable   │   │  [newest→old] │  │
+│  └──────┬───────┘  └──────┬──────┘   └───────┬───────┘  │
 │         │   freeze/flush  │                  │          │
 │  ┌──────▼───────┐         │          ┌───────▼───────┐  │
 │  │     WAL      │         │          │   MANIFEST    │  │
@@ -191,11 +191,11 @@ After compaction the store has exactly one SSTable.
 
 Executed under a **read lock**, in newest-to-oldest order:
 
-| Step | Source | Method | Short-circuit condition |
-|------|--------|--------|------------------------|
-| 1 | Active MemTable | `Lookup(key)` | Returns value if found and not tombstoned; returns `ErrKeyNotFound` if tombstoned |
-| 2 | Immutable MemTable | `Lookup(key)` | Same as above (only checked if non-nil) |
-| 3 | SSTables (newest → oldest) | `Reader.Get(key)` | `ErrTombstone` stops the search immediately |
+| Step | Source                     | Method            | Short-circuit condition                                                           |
+| ---- | -------------------------- | ----------------- | --------------------------------------------------------------------------------- |
+| 1    | Active MemTable            | `Lookup(key)`     | Returns value if found and not tombstoned; returns `ErrKeyNotFound` if tombstoned |
+| 2    | Immutable MemTable         | `Lookup(key)`     | Same as above (only checked if non-nil)                                           |
+| 3    | SSTables (newest → oldest) | `Reader.Get(key)` | `ErrTombstone` stops the search immediately                                       |
 
 The key insight is **tombstone short-circuit**: when a layer returns `ErrTombstone` it means the most-recent record for that key is a deletion marker. There is no need to check older layers — the key is definitively deleted.
 
@@ -268,13 +268,13 @@ A `LogWriter` is opened in append mode on the `wal` path. The store is now ready
 
 ### Recovery invariants
 
-| Scenario | Recovery |
-|----------|----------|
-| Crash before WAL fsync | Record not in WAL → not recovered (caller got an error) |
-| Crash after WAL fsync, before memtable insert | WAL replay re-inserts on restart |
-| Crash during background flush (SSTable write) | Incomplete SSTable not in manifest → ignored; `wal.immutable` replayed |
-| Crash after manifest `add` but before `wal.immutable` removed | SSTable loaded from manifest; duplicate WAL replay is idempotent |
-| Crash during compaction, after new SSTable `add` | Old SSTables still in manifest (their `del` not written) → both old and new loaded; duplicate keys resolved by merge |
+| Scenario                                                      | Recovery                                                                                                             |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Crash before WAL fsync                                        | Record not in WAL → not recovered (caller got an error)                                                              |
+| Crash after WAL fsync, before memtable insert                 | WAL replay re-inserts on restart                                                                                     |
+| Crash during background flush (SSTable write)                 | Incomplete SSTable not in manifest → ignored; `wal.immutable` replayed                                               |
+| Crash after manifest `add` but before `wal.immutable` removed | SSTable loaded from manifest; duplicate WAL replay is idempotent                                                     |
+| Crash during compaction, after new SSTable `add`              | Old SSTables still in manifest (their `del` not written) → both old and new loaded; duplicate keys resolved by merge |
 
 ---
 
@@ -288,12 +288,12 @@ tinyKV uses a **dual-lock** design that allows WAL writes from multiple goroutin
 
 `mu` guards the store's structural state (which memtable is active, which SSTables exist, and whether a flush is in progress).
 
-| Operation | Lock held |
-|-----------|-----------|
+| Operation                                      | Lock held              |
+| ---------------------------------------------- | ---------------------- |
 | `Put`, `Delete` (WAL append + SkipList insert) | Read lock (`mu.RLock`) |
-| `Get`, `Scan` (iterator construction) | Read lock (`mu.RLock`) |
-| `freeze()`, `compact()`, `Close()` | Write lock (`mu.Lock`) |
-| Background flush I/O | **No lock** |
+| `Get`, `Scan` (iterator construction)          | Read lock (`mu.RLock`) |
+| `freeze()`, `compact()`, `Close()`             | Write lock (`mu.Lock`) |
+| Background flush I/O                           | **No lock**            |
 
 Holding `mu.RLock` during `Put`/`Delete` means **multiple writers can proceed concurrently through the WAL** — the write-stealing leader inside `LogWriter` batches their records together without needing exclusive access to `mu`.
 
@@ -301,11 +301,11 @@ Holding `mu.RLock` during `Put`/`Delete` means **multiple writers can proceed co
 
 `memMu` serialises access to the active SkipList. It is always acquired **inside** `mu` (i.e., with `mu` already held).
 
-| Operation | Lock held |
-|-----------|-----------|
+| Operation                         | Lock held                 |
+| --------------------------------- | ------------------------- |
 | SkipList insert (`Put`, `Delete`) | Write lock (`memMu.Lock`) |
-| SkipList lookup (`Get`) | Read lock (`memMu.RLock`) |
-| SkipList scan (`Scan`) | Read lock (`memMu.RLock`) |
+| SkipList lookup (`Get`)           | Read lock (`memMu.RLock`) |
+| SkipList scan (`Scan`)            | Read lock (`memMu.RLock`) |
 
 ### Lock ordering rule
 
@@ -348,8 +348,8 @@ Each record is written with no framing or CRC. Crash-safety relies on treating a
 
 ```
 ┌─────────────────┬──────────────────────────────┬──────────┬───────────────┐
-│ uvarint(keyLen) │ uvarint(valueLen<<1 | tsBit)  │ key bytes│ value bytes   │
-│   (1–10 bytes)  │         (1–10 bytes)          │ (keyLen) │ (0 if ts=1)   │
+│ uvarint(keyLen) │ uvarint(valueLen<<1 | tsBit) │ key bytes│ value bytes   │
+│   (1–10 bytes)  │         (1–10 bytes)         │ (keyLen) │ (0 if ts=1)   │
 └─────────────────┴──────────────────────────────┴──────────┴───────────────┘
 ```
 
@@ -389,10 +389,10 @@ Records are packed contiguously. A block is flushed when `len(dataBuf) >= 4096`.
 One entry per data block, written sequentially:
 
 ```
-┌──────────────────┬──────────┬───────────────────┬──────────────────────┐
+┌──────────────────┬──────────┬────────────────────┬──────────────────────┐
 │ uvarint(keyLen)  │ key bytes│ uint64 LE (offset) │ uint64 LE (length)   │
 │   (1–10 bytes)   │ (keyLen) │     (8 bytes)      │      (8 bytes)       │
-└──────────────────┴──────────┴───────────────────┴──────────────────────┘
+└──────────────────┴──────────┴────────────────────┴──────────────────────┘
 ```
 
 The `key` stored is the **last key** of the data block. This enables binary search: find the first block whose last key `>= target key`.
@@ -402,7 +402,7 @@ The `key` stored is the **last key** of the data block. This enables binary sear
 ```
 ┌────────────────────┬───────────────────────────────┐
 │  k  (uint32 LE)    │  bit array (variable length)  │
-│    (4 bytes)       │  ⌈n × 10⌉ / 8 bytes          │
+│    (4 bytes)       │  ⌈n × 10⌉ / 8 bytes           │
 └────────────────────┴───────────────────────────────┘
 ```
 
@@ -436,24 +436,24 @@ SSTable file names are `<unix-nanosecond-timestamp>.sst`, which guarantees monot
 
 ## 8. Component Index
 
-| Package / File | Role | Dedicated doc |
-|----------------|------|---------------|
-| `main.go` | CLI entry point, REPL loop, signal handling | — |
-| `src/errors.go` | `ErrKeyNotFound`, `ErrTombstone`, `KeyNotFoundError` | [src/README.md](../src/README.md) |
-| `src/memtable/memtable.go` | `MemTableI` and `MemTableIteratorI` interfaces | [src/memtable/README.md](../src/memtable/README.md) |
-| `src/memtable/skip_list.go` | `SkipList` (max height 12) + `skipListIterator` | [src/memtable/README.md](../src/memtable/README.md) |
-| `src/wal/wal.go` | `LogWriterI` and `LogReaderI` interfaces | [src/wal/README.md](../src/wal/README.md) |
-| `src/wal/dto.go` | `LogEntry` data transfer object | [src/wal/README.md](../src/wal/README.md) |
-| `src/wal/writer.go` | `LogWriter` — write-stealing leader election for low-latency durable batch writes | [src/wal/README.md](../src/wal/README.md) |
-| `src/wal/reader.go` | `LogReader` — sequential decoder, crash-safe EOF | [src/wal/README.md](../src/wal/README.md) |
-| `src/sstable/sstable.go` | `BlockHandle`, `Footer`, `BlockSize`, `FooterSize` constants | [src/sstable/README.md](../src/sstable/README.md) |
-| `src/sstable/bloom.go` | `BloomFilter` — double-hashing FNV, encode/decode | [src/sstable/README.md](../src/sstable/README.md) |
-| `src/sstable/writer.go` | `Writer` — buffers records into 4 KB data blocks | [src/sstable/README.md](../src/sstable/README.md) |
-| `src/sstable/reader.go` | `Reader` + `sstableIterator` — bloom + index + block scan | [src/sstable/README.md](../src/sstable/README.md) |
-| `src/store/store.go` | `StoreI` interface, `Store` engine, write/read/flush/compact | [src/store/README.md](../src/store/README.md) |
-| `src/store/manifest.go` | `manifest` — append-only JSON log of SSTable lifecycle | [src/store/README.md](../src/store/README.md) |
-| `src/store/merge_iterator.go` | `mergeIterator` — min-heap k-way merge, deduplication | [src/store/README.md](../src/store/README.md) |
-| `e2e/e2e_test.go` | End-to-end tests (builds binary, drives via stdin) | — |
+| Package / File                | Role                                                                              | Dedicated doc                                       |
+| ----------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `main.go`                     | CLI entry point, REPL loop, signal handling                                       | —                                                   |
+| `src/errors.go`               | `ErrKeyNotFound`, `ErrTombstone`, `KeyNotFoundError`                              | [src/errors.md](src/errors.md)                      |
+| `src/memtable/memtable.go`    | `MemTableI` and `MemTableIteratorI` interfaces                                    | [src/memtable/README.md](../src/memtable/README.md) |
+| `src/memtable/skip_list.go`   | `SkipList` (max height 12) + `skipListIterator`                                   | [src/memtable/README.md](../src/memtable/README.md) |
+| `src/wal/wal.go`              | `LogWriterI` and `LogReaderI` interfaces                                          | [src/wal/README.md](../src/wal/README.md)           |
+| `src/wal/dto.go`              | `LogEntry` data transfer object                                                   | [src/wal/README.md](../src/wal/README.md)           |
+| `src/wal/writer.go`           | `LogWriter` — write-stealing leader election for low-latency durable batch writes | [src/wal/README.md](../src/wal/README.md)           |
+| `src/wal/reader.go`           | `LogReader` — sequential decoder, crash-safe EOF                                  | [src/wal/README.md](../src/wal/README.md)           |
+| `src/sstable/sstable.go`      | `BlockHandle`, `Footer`, `BlockSize`, `FooterSize` constants                      | [src/sstable/README.md](../src/sstable/README.md)   |
+| `src/sstable/bloom.go`        | `BloomFilter` — double-hashing FNV, encode/decode                                 | [src/sstable/README.md](../src/sstable/README.md)   |
+| `src/sstable/writer.go`       | `Writer` — buffers records into 4 KB data blocks                                  | [src/sstable/README.md](../src/sstable/README.md)   |
+| `src/sstable/reader.go`       | `Reader` + `sstableIterator` — bloom + index + block scan                         | [src/sstable/README.md](../src/sstable/README.md)   |
+| `src/store/store.go`          | `StoreI` interface, `Store` engine, write/read/flush/compact                      | [src/store/README.md](../src/store/README.md)       |
+| `src/store/manifest.go`       | `manifest` — append-only JSON log of SSTable lifecycle                            | [src/store/README.md](../src/store/README.md)       |
+| `src/store/merge_iterator.go` | `mergeIterator` — min-heap k-way merge, deduplication                             | [src/store/README.md](../src/store/README.md)       |
+| `e2e/e2e_test.go`             | End-to-end tests (builds binary, drives via stdin)                                | —                                                   |
 
 ---
 
@@ -480,15 +480,15 @@ go build -o tinyKV .
 
 ### REPL commands
 
-Once running, the store presents a `> ` prompt:
+Once running, the store presents a `>` prompt:
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `put <key> <value>` | Store or overwrite a key | `put hello world` |
-| `get <key>` | Retrieve a value | `get hello` → `world` |
-| `delete <key>` | Delete a key (writes a tombstone) | `delete hello` |
-| `scan <startKey> <endKey>` | Range scan, **end key exclusive** | `scan a z` |
-| `exit` / `quit` | Flush and close gracefully | `exit` |
+| Command                    | Description                       | Example               |
+| -------------------------- | --------------------------------- | --------------------- |
+| `put <key> <value>`        | Store or overwrite a key          | `put hello world`     |
+| `get <key>`                | Retrieve a value                  | `get hello` → `world` |
+| `delete <key>`             | Delete a key (writes a tombstone) | `delete hello`        |
+| `scan <startKey> <endKey>` | Range scan, **end key exclusive** | `scan a z`            |
+| `exit` / `quit`            | Flush and close gracefully        | `exit`                |
 
 `Ctrl-D` (EOF on stdin) also triggers a graceful shutdown, as do `SIGINT` and `SIGTERM`.
 
@@ -549,22 +549,22 @@ go test -v -run TestE2EPersistence ./e2e/...
 
 ### Test coverage
 
-| Test | What it verifies |
-|------|-----------------|
-| `TestE2EPutGet` | Basic write and read |
-| `TestE2EGetMissing` | Missing key returns `(not found)` |
-| `TestE2EOverwrite` | Second `put` on same key replaces the value |
-| `TestE2EDelete` | Delete followed by get returns `(not found)` |
-| `TestE2EDeleteNonExistent` | Deleting a key that was never written succeeds |
-| `TestE2EScan` | Scan returns keys sorted ascending |
-| `TestE2EScanEndKeyExclusive` | End key is excluded from scan results |
-| `TestE2EScanEmpty` | Scan on empty store returns `(no results)` |
-| `TestE2EScanTombstonesExcluded` | Deleted keys do not appear in scan results |
-| `TestE2EPersistence` | Data survives a process restart |
-| `TestE2EPersistenceAfterDelete` | Delete persists across restart |
-| `TestE2EPersistenceMultipleKeys` | Multiple keys survive restart |
-| `TestE2EOverwriteThenScan` | Scan after overwrite shows new value |
-| `TestE2ELargeWorkload` | 50 keys written and verified |
+| Test                             | What it verifies                               |
+| -------------------------------- | ---------------------------------------------- |
+| `TestE2EPutGet`                  | Basic write and read                           |
+| `TestE2EGetMissing`              | Missing key returns `(not found)`              |
+| `TestE2EOverwrite`               | Second `put` on same key replaces the value    |
+| `TestE2EDelete`                  | Delete followed by get returns `(not found)`   |
+| `TestE2EDeleteNonExistent`       | Deleting a key that was never written succeeds |
+| `TestE2EScan`                    | Scan returns keys sorted ascending             |
+| `TestE2EScanEndKeyExclusive`     | End key is excluded from scan results          |
+| `TestE2EScanEmpty`               | Scan on empty store returns `(no results)`     |
+| `TestE2EScanTombstonesExcluded`  | Deleted keys do not appear in scan results     |
+| `TestE2EPersistence`             | Data survives a process restart                |
+| `TestE2EPersistenceAfterDelete`  | Delete persists across restart                 |
+| `TestE2EPersistenceMultipleKeys` | Multiple keys survive restart                  |
+| `TestE2EOverwriteThenScan`       | Scan after overwrite shows new value           |
+| `TestE2ELargeWorkload`           | 50 keys written and verified                   |
 
 ### Unit tests
 
